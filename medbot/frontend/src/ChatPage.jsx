@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { FiSend, FiRefreshCw, FiFileText, FiPlus, FiMessageCircle, FiClock, FiCheckCircle, FiAlertCircle } from 'react-icons/fi';
 import { MdMedicalServices, MdOutlineHistory, MdOutlineHealthAndSafety } from 'react-icons/md';
 import { BsArrowRightCircle, BsExclamationTriangle } from 'react-icons/bs';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from './AuthContext';
 
 const diagnosisStyles = `
   /* Add new styles for the diagnosis card */
@@ -89,10 +91,12 @@ const diagnosisStyles = `
 `;
 
 const ChatPage = () => {
+  const navigate = useNavigate();
+  const { user, logout } = useAuth();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [chatHistory, setChatHistory] = useState([]);
-  const [userId] = useState(`user-${Math.random().toString(36).substr(2, 9)}`);
+  const [userId, setUserId] = useState(`user-${Math.random().toString(36).substr(2, 9)}`);
   const [currentStep, setCurrentStep] = useState('start');
   const [patientData, setPatientData] = useState({
     symptoms: [],
@@ -114,6 +118,16 @@ const ChatPage = () => {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  useEffect(() => {
+    // If we have a user from auth context, use their ID
+    if (user && user.user_id) {
+      setUserId(user.user_id);
+    } else {
+      // No authenticated user, redirect to login
+      navigate('/login');
+    }
+  }, [user, navigate]);
 
   useEffect(() => {
     // Add initial welcome message only once when component mounts
@@ -255,7 +269,8 @@ const ChatPage = () => {
         isLoading: true
       }]);
 
-      const response = await fetch('http://localhost:8000/chat', {
+      // Use fetchWithAuth instead of fetch
+      const response = await fetchWithAuth('http://localhost:8000/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -272,6 +287,15 @@ const ChatPage = () => {
       if (!response.ok) {
         const errorData = await response.json();
         console.error('Server error:', errorData);
+        
+        // If unauthorized, redirect to login
+        if (response.status === 401) {
+          localStorage.removeItem('medbot_token');
+          localStorage.removeItem('medbot_user');
+          navigate('/login');
+          throw new Error('Session expired. Please login again.');
+        }
+        
         throw new Error(errorData.detail || `Server error: ${response.status}`);
       }
 
@@ -337,7 +361,7 @@ const ChatPage = () => {
   
   const fetchUserData = async () => {
     try {
-      const response = await fetch(`http://localhost:8000/user/${userId}`);
+      const response = await fetchWithAuth(`http://localhost:8000/user/${userId}`);
       if (response.ok) {
         const data = await response.json();
         console.log('User data:', data);
@@ -362,6 +386,7 @@ const ChatPage = () => {
       role: 'assistant',
       content: 'Hello! I am your medical assistant. How can I help you today?'
     }]);
+    
     setPatientData({
       symptoms: [],
       previous_history: "",
@@ -370,13 +395,42 @@ const ChatPage = () => {
       diagnosis: "",
       critical: false
     });
+    
     setCurrentStep('start');
     setConversationComplete(false);
     setShowSummaryButton(false);
     setMessageCount(0); // Reset message counter
     
-    // Use a new userId to completely separate from previous consultation
-    window.location.reload(); // This is the simplest way to reset everything
+    // Create a new consultation ID in the existing user's data store
+    // Skip the window.location.reload() which is causing the logout issue
+    console.log("Starting new consultation with existing user ID:", userId);
+    
+    // Optional: You can send a simple message to reset the backend state
+    // without creating a new endpoint
+    const resetBackendState = async () => {
+      try {
+        // Use the existing chat endpoint with a special "reset" message
+        const response = await fetchWithAuth('http://localhost:8000/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            user_id: userId,
+            response: "__reset__" // Special token that your backend can recognize
+          }),
+        });
+        
+        if (!response.ok) {
+          console.error('Failed to reset backend state');
+        }
+      } catch (error) {
+        console.error('Error resetting backend state:', error);
+        // Even if this fails, we'll still continue with the reset front-end state
+      }
+    };
+    
+    resetBackendState();
   };
 
   // Current step indicator with icons
@@ -414,7 +468,7 @@ const ChatPage = () => {
       }]);
 
       // Make a special request to generate the summary
-      const response = await fetch('http://localhost:8000/generate_summary', {
+      const response = await fetchWithAuth('http://localhost:8000/generate_summary', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -864,13 +918,60 @@ const ChatPage = () => {
 
   const stepInfo = getStepInfo();
 
+  // Update fetch calls to include the authorization token
+  const fetchWithAuth = async (url, options = {}) => {
+    const token = localStorage.getItem('medbot_token');
+    
+    if (!token) {
+      navigate('/login');
+      throw new Error('Not authenticated');
+    }
+    
+    const authOptions = {
+      ...options,
+      headers: {
+        ...options.headers,
+        'Authorization': `Bearer ${token}`
+      }
+    };
+    
+    return fetch(url, authOptions);
+  };
+
+  // Add logout functionality
+  const handleLogout = () => {
+    logout(); // Use the logout function from context
+    navigate('/login');
+  };
+
   return (
     <div className="flex h-screen bg-gray-50">
       {/* Sidebar - now with light theme */}
       <div className="w-64 bg-white p-4 border-r border-gray-200 shadow-sm">
+        {/* User profile section */}
+        {user && (
+          <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-100">
+            <div className="flex items-center mb-2">
+              <div className="bg-blue-500 text-white rounded-full w-8 h-8 flex items-center justify-center">
+                {user.name.charAt(0).toUpperCase()}
+              </div>
+              <div className="ml-2">
+                <p className="font-medium text-gray-800">{user.name}</p>
+                <p className="text-xs text-gray-500">{user.email}</p>
+              </div>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="text-sm text-blue-600 hover:text-blue-800"
+            >
+              Sign out
+            </button>
+          </div>
+        )}
+
         <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
           <MdMedicalServices className="text-blue-500" />
-          <span>Medbot</span>
+          <span>Medical Assistant</span>
         </h2>
         
         {/* Current step indicator */}

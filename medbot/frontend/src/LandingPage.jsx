@@ -12,12 +12,20 @@ const LandingPage = () => {
             <MdMedicalServices className="text-blue-500" />
             MedBot
           </h1>
-          <button
-            onClick={() => navigate('/chat')}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg transition-all shadow-sm flex items-center gap-2"
-          >
-            <span>Try MedBot</span>
-          </button>
+          <div className="flex space-x-4">
+            <button
+              onClick={() => navigate('/login')}
+              className="bg-white hover:bg-gray-100 text-blue-600 px-6 py-2 rounded-lg border border-blue-200 transition-all shadow-sm"
+            >
+              Login
+            </button>
+            <button
+              onClick={() => navigate('/register')}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg transition-all shadow-sm flex items-center gap-2"
+            >
+              <span>Sign Up</span>
+            </button>
+          </div>
         </nav>
 
         <div className="max-w-4xl mx-auto text-center">
@@ -39,7 +47,7 @@ const LandingPage = () => {
           </div>
 
           <button
-            onClick={() => navigate('/chat')}
+            onClick={() => navigate('/register')}
             className="bg-blue-600 hover:bg-blue-700 text-white text-lg px-8 py-3 rounded-lg transition-all shadow-sm flex items-center gap-2 mx-auto"
           >
             <MdOutlineHealthAndSafety size={20} />

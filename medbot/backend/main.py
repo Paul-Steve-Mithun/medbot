@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import BaseModel
 import langgraph
 from langgraph.graph import StateGraph, START
@@ -7,10 +7,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain_groq import ChatGroq
 import os
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+from datetime import datetime
+import uuid
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import timedelta
 
 # Load environment variables
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# MongoDB Connection
+MONGODB_URI = os.getenv("MONGODB_URI")
+client = MongoClient(MONGODB_URI)
+db = client.medbot_db
+users_collection = db.users
+
+# Password and JWT Security
+SECRET_KEY = os.getenv("SECRET_KEY", "a_default_secret_key_for_development_only")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Initialize LLM
 llm = ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=GROQ_API_KEY)
@@ -569,11 +591,29 @@ def assess_criticality(state):
     user_id = state_dict["user_id"]
     user_data = get_user_data(user_id)
     
-    # Assess criticality
     symptoms_text = ", ".join(user_data.symptoms)
     prev_history = user_data.previous_history
     med_history = user_data.medication_history
     diagnosis = user_data.diagnosis
+    
+    urgency_check_prompt = f"""Based on the following patient information:
+    
+    Symptoms: {symptoms_text}
+    Previous Medical History: {prev_history}
+    Medication History: {med_history}
+    Diagnosis: {diagnosis}
+    
+    Is this potentially an urgent medical situation requiring immediate attention?
+    Answer with ONLY 'YES' or 'NO'.
+    """
+    
+    urgency_response = llm.invoke(urgency_check_prompt).strip().upper()
+    
+    if urgency_response == 'YES':
+        print("Detected urgent medical situation, routing to urgent follow-up handler")
+        state_dict["urgency_level"] = "urgent"
+        update_user_state(user_id, state_dict)
+        return urgent_follow_up_handler(state_dict)
     
     criticality_prompt = f"""Based on the following patient information:
     
@@ -604,7 +644,6 @@ def assess_criticality(state):
     assessment = llm.invoke(criticality_prompt)
     assessment_text = assessment.content
     
-    # Extract urgency (looking for the word URGENT in the urgency level section)
     is_critical = "URGENT" in assessment_text
     update_user_data(user_id, "critical", "yes" if is_critical else "no")
     
@@ -1160,12 +1199,194 @@ graph.add_edge("diagnosis_node", "criticality_node")
 # Compile Graph
 chatbot = graph.compile()
 
-# Chat endpoint
-@app.post("/chat")
-async def chat(user_response: UserResponse):
+# Add these new models for user registration
+class UserRegistration(BaseModel):
+    name: str
+    email: str
+    password: str
+    gender: str
+    age: int
+    comorbidities: List[str] = []
+    medications: List[str] = []
+    allergies: List[str] = []
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+# User authentication helper functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# User database functions
+def get_user_by_email(email: str):
+    user = users_collection.find_one({"email": email})
+    return user
+
+def authenticate_user(email: str, password: str):
+    user = get_user_by_email(email)
+    if not user:
+        return False
+    if not verify_password(password, user["hashed_password"]):
+        return False
+    return user
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+        token_data = TokenData(email=email)
+    except JWTError:
+        raise credentials_exception
+    user = get_user_by_email(email=token_data.email)
+    if user is None:
+        raise credentials_exception
+    return user
+
+# Add these new endpoints for user registration and login
+@app.post("/register", response_model=dict)
+async def register_user(user_data: UserRegistration):
+    # Check if user already exists
+    existing_user = users_collection.find_one({"email": user_data.email})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user document
+    new_user = {
+        "user_id": f"user-{uuid.uuid4().hex[:8]}",
+        "name": user_data.name,
+        "email": user_data.email,
+        "hashed_password": get_password_hash(user_data.password),
+        "gender": user_data.gender,
+        "age": user_data.age,
+        "comorbidities": user_data.comorbidities,
+        "medications": user_data.medications,
+        "allergies": user_data.allergies,
+        "created_at": datetime.utcnow(),
+        "chat_history": []
+    }
+    
+    try:
+        users_collection.insert_one(new_user)
+        # Create access token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user_data.email}, expires_delta=access_token_expires
+        )
+        
+        return {
+            "user_id": new_user["user_id"],
+            "name": new_user["name"],
+            "email": new_user["email"],
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+    except PyMongoError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["email"]}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/login", response_model=dict)
+async def login_user(user_data: UserLogin):
+    user = authenticate_user(user_data.email, user_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password"
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user_data.email}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "user_id": user["user_id"],
+        "name": user["name"],
+        "email": user["email"],
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+@app.get("/users/me", response_model=dict)
+async def read_users_me(current_user: dict = Depends(get_current_user)):
+    return {
+        "user_id": current_user["user_id"],
+        "name": current_user["name"],
+        "email": current_user["email"],
+        "gender": current_user["gender"],
+        "age": current_user["age"],
+        "comorbidities": current_user["comorbidities"],
+        "medications": current_user["medications"],
+        "allergies": current_user["allergies"]
+    }
+
+# Modify the existing chat endpoint to work with registered users
+@app.post("/chat")
+async def chat(user_response: UserResponse, token: str = Depends(oauth2_scheme)):
+    try:
+        # Decode token to get user
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        user_db = get_user_by_email(email)
+        
+        if not user_db:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found"
+            )
+        
+        # Use the user's ID from the database
+        user_id = user_db["user_id"]
+        
+        # Rest of your existing chat logic here, using user_id
         print(f"Received request: {user_response}")
-        user_id = user_response.user_id
         
         # ADDED: Special handling for "get_diagnosis" token to force diagnosis generation
         if user_response.response in ["get_diagnosis", "provide diagnosis", "diagnose"]:
@@ -1192,13 +1413,23 @@ async def chat(user_response: UserResponse):
             next_state = diagnosis_prep_handler(state_dict)
             
             # Extract and return
-            question = next_state.get("current_question", "Unable to generate diagnosis with current information")
+            next_question = next_state.get("current_question", "Unable to generate diagnosis with current information")
             
             # Store the updated state
-            update_user_data(user_id, "current_question", question)
+            update_user_data(user_id, "current_question", next_question)
             update_user_data(user_id, "current_step", "criticality")
             
-            return {"next_question": question, "current_step": "criticality"}
+            # Store chat history in user document
+            users_collection.update_one(
+                {"user_id": user_id},
+                {"$push": {"chat_history": {
+                    "timestamp": datetime.utcnow(),
+                    "user_message": user_response.response,
+                    "bot_response": next_question
+                }}}
+            )
+            
+            return {"next_question": next_question, "current_step": "criticality"}
         
         # Special handling for "continue" token to always proceed to next step
         if user_response.response == "continue":
@@ -1231,14 +1462,24 @@ async def chat(user_response: UserResponse):
                 next_state = process_step(next_step, state_dict)
                 
                 # Extract question and step
-                question = next_state.get("current_question", "What can I help you with?")
-                step = next_state.get("current_step", "unknown")
+                next_question = next_state.get("current_question", "What can I help you with?")
+                current_step = next_state.get("current_step", "unknown")
                 
                 # Store the current question and step
-                update_user_data(user_id, "current_question", question)
-                update_user_data(user_id, "current_step", step)
+                update_user_data(user_id, "current_question", next_question)
+                update_user_data(user_id, "current_step", current_step)
                 
-                return {"next_question": question, "current_step": step}
+                # Store chat history in user document
+                users_collection.update_one(
+                    {"user_id": user_id},
+                    {"$push": {"chat_history": {
+                        "timestamp": datetime.utcnow(),
+                        "user_message": user_response.response,
+                        "bot_response": next_question
+                    }}}
+                )
+                
+                return {"next_question": next_question, "current_step": current_step}
         
         # Check if this is a first-time interaction with this user
         is_first_interaction = user_id not in user_data_store
@@ -1320,14 +1561,38 @@ async def chat(user_response: UserResponse):
                         # Store the partial answer but stay on the same step
                         update_user_data(user_id, "partial_" + current_step, user_response.response, validation_details)
                         
+                        next_question = validation["feedback"]
+                        
+                        # Store chat history in user document
+                        users_collection.update_one(
+                            {"user_id": user_id},
+                            {"$push": {"chat_history": {
+                                "timestamp": datetime.utcnow(),
+                                "user_message": user_response.response,
+                                "bot_response": next_question
+                            }}}
+                        )
+                        
                         return {
-                            "next_question": validation["feedback"],
+                            "next_question": next_question,
                             "current_step": current_step  # Stay on the same step
                         }
                     else:
                         # Regular invalid response
+                        next_question = validation["feedback"]
+                        
+                        # Store chat history in user document
+                        users_collection.update_one(
+                            {"user_id": user_id},
+                            {"$push": {"chat_history": {
+                                "timestamp": datetime.utcnow(),
+                                "user_message": user_response.response,
+                                "bot_response": next_question
+                            }}}
+                        )
+                        
                         return {
-                            "next_question": validation["feedback"],
+                            "next_question": next_question,
                             "current_step": current_step  # Stay on the same step
                         }
                 
@@ -1354,24 +1619,42 @@ async def chat(user_response: UserResponse):
         if not isinstance(next_state, dict):
             raise HTTPException(status_code=500, detail=f"Expected dict, got {type(next_state)}")
             
-        question = next_state.get("current_question", "What can I help you with?")
-        step = next_state.get("current_step", "unknown")
+        next_question = next_state.get("current_question", "What can I help you with?")
+        current_step = next_state.get("current_step", "unknown")
         
         # Store the current question for future validation
-        update_user_data(user_id, "current_question", question)
+        update_user_data(user_id, "current_question", next_question)
         
         # Store the current step in history for next time
-        update_user_data(user_id, "current_step", step)
+        update_user_data(user_id, "current_step", current_step)
         
-        print(f"Returning question: {question}, step: {step}")
+        print(f"Returning question: {next_question}, step: {current_step}")
         
-        return {"next_question": question, "current_step": step}
+        # Store chat history in user document
+        users_collection.update_one(
+            {"user_id": user_id},
+            {"$push": {"chat_history": {
+                "timestamp": datetime.utcnow(),
+                "user_message": user_response.response,
+                "bot_response": next_question
+            }}}
+        )
+        
+        return {"next_question": next_question, "current_step": current_step}
     
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
     except Exception as e:
         print(f"Error in chat endpoint: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred: {str(e)}"
+        )
 
 # Helper function to determine the next step based on the current step
 def determine_next_step(state):
@@ -1415,30 +1698,23 @@ def determine_next_step(state):
 def process_step(step_name, state):
     state_dict = ensure_dict(state)
     
-    # Make sure custom_context is initialized
     if "custom_context" not in state_dict:
         state_dict["custom_context"] = {}
     
-    # ADDED: Check for repetitive conversation patterns and force progression
     if step_name.endswith("_continued") and "_continued_continued" in step_name:
-        # If we see nested continuations, it's time to move to diagnosis
         print(f"Detected nested continuations in {step_name}, forcing diagnosis")
         state_dict["current_question"] = "I believe I have sufficient information now. Let me provide a preliminary diagnosis based on what you've shared."
         state_dict["current_step"] = "diagnosis_prep"
         return diagnosis_prep_handler(state_dict)
     
-    # Add special handling for first-time accident reports
     if step_name == "initial_assessment" and state_dict.get("response", "").lower() and "accident" in state_dict.get("response", "").lower():
-        # Force this to go through accident assessment
         return assess_initial_urgency(state_dict)
     
-    # Special cases for steps that should auto-progress
     if step_name == "diagnosis_prep":
         return diagnosis_prep_handler(state_dict)
     elif step_name == "additional_symptoms_node":
         return additional_symptoms_handler(state_dict)
     
-    # Update handlers dictionary to include all dynamic handlers
     handlers = {
         "start": start_node,
         "initial_assessment": assess_initial_urgency,
@@ -1472,22 +1748,17 @@ def update_user_state(user_id, state):
     if user_id not in user_data_store:
         user_data_store[user_id] = UserData(user_id=user_id)
     
-    # The state dict is already updated during the specific node handlers
-    # This function is mainly to ensure we have a user record
     pass
 
-# Get user data endpoint
 @app.get("/user/{user_id}")
 def get_user(user_id: str):
     user_data = get_user_data(user_id)
     return user_data
 
-# Debug endpoint
 @app.get("/debug/users")
 def debug_users():
     return {"user_count": len(user_data_store), "users": {k: v.dict() for k, v in user_data_store.items()}}
 
-# Add this new endpoint for summary generation
 @app.post("/generate_summary")
 async def generate_summary_endpoint(user_data_request: dict):
     try:
@@ -1500,10 +1771,8 @@ async def generate_summary_endpoint(user_data_request: dict):
         if not user_data or not user_data.symptoms:
             return {"summary": "## Medical Case Summary\n\nInsufficient data to generate a medical case summary. Please complete the consultation."}
         
-        # Create a professional medical summary for doctors
         symptoms_text = ", ".join(user_data.symptoms)
         
-        # Extract validation details for more accurate summary
         history_with_validation = [item for item in user_data.history if "validation_details" in item]
         extracted_details = {}
         
@@ -1541,24 +1810,10 @@ async def generate_summary_endpoint(user_data_request: dict):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# Improved validation function to be more context-aware
 async def validate_response(question, response, expected_type):
-    """
-    Validates if a user response is relevant to the question being asked.
-    
-    Args:
-        question: The question that was asked
-        response: The user's response
-        expected_type: What kind of answer we expect (symptoms, history, etc.)
-    
-    Returns:
-        dict: Containing validation result, feedback, and processed response
-    """
-    # Skip validation for continue message (used in auto-continuation)
     if response == "continue":
         return {"is_valid": True, "feedback": None, "processed_response": response}
     
-    # Special handling for multi-part questions
     if expected_type == "previous_history" and response.lower() == "yes":
         return {
             "is_valid": False,
@@ -1571,9 +1826,7 @@ async def validate_response(question, response, expected_type):
             }
         }
     
-    # Handle known medical conditions in initial prompt
     if expected_type == "symptoms" and any(condition in response.lower() for condition in ["diabetes", "diabetic", "hypertension", "asthma", "chronic"]):
-        # Extract the condition mentioned
         conditions = []
         for condition in ["diabetes", "diabetic", "hypertension", "asthma", "copd", "arthritis", "thyroid"]:
             if condition in response.lower():
@@ -1590,13 +1843,11 @@ async def validate_response(question, response, expected_type):
                 "reason": f"Patient disclosed medical condition: {condition_str}",
                 "is_chronic_condition": True,
                 "medical_conditions": conditions,
-                "extracted_symptoms": conditions  # Store as symptoms for processing
+                "extracted_symptoms": conditions
             }
         }
     
-    # Less strict validation for short answers
-    if len(response.strip()) <= 20:  # Increased length to catch short condition statements
-        # Only challenge very short answers for symptom collection if they don't provide health info
+    if len(response.strip()) <= 20:
         if expected_type == "symptoms" and response.lower() in ["hi", "hello"]:
             return {
                 "is_valid": False,
@@ -1604,7 +1855,6 @@ async def validate_response(question, response, expected_type):
                 "processed_response": response,
                 "details": {"is_valid": False, "reason": "Greeting instead of symptoms"}
             }
-        # For symptoms, we want more detail if the answer is too short but doesn't mention a condition
         elif expected_type == "symptoms" and not any(word in response.lower() for word in ["diabetes", "pain", "ache", "hurt", "sick"]):
             return {
                 "is_valid": False,
@@ -1612,9 +1862,7 @@ async def validate_response(question, response, expected_type):
                 "processed_response": response,
                 "details": {"is_valid": False, "reason": "The user's response is too brief and lacks detail about their current health concern."}
             }
-        # For previous_history, allow short answers like "no" or "viral fever"
         elif expected_type == "previous_history":
-            # Common short answers to medical history questions are valid
             has_consulted = "yes" in response.lower()
             extracted_diagnosis = response if "no" not in response.lower() else ""
             
@@ -1628,11 +1876,9 @@ async def validate_response(question, response, expected_type):
                     "extracted_diagnosis": extracted_diagnosis
                 }
             }
-        # For other steps, short answers are usually valid
         else:
             return {"is_valid": True, "feedback": None, "processed_response": response}
     
-    # Check if this is a multi-part question and if all parts are answered
     multi_part_check = validate_multi_part_response(question, response, expected_type)
     
     if not multi_part_check["is_complete"]:
@@ -1647,7 +1893,6 @@ async def validate_response(question, response, expected_type):
             }
         }
     
-    # Set up validation prompts for different expected response types
     validation_prompts = {
         "previous_history": f"""
             As a medical assistant, evaluate if the following response addresses medical history or doctor consultations.
@@ -1739,32 +1984,26 @@ async def validate_response(question, response, expected_type):
         """
     }
     
-    # Use the appropriate validation prompt (default to general if not specified)
     prompt = validation_prompts.get(expected_type, validation_prompts["general"])
     
     try:
-        # Use the LLM to validate the response
         validation_result = llm.invoke(prompt)
         
-        # Extract JSON from the response
         import json
         import re
         
-        # Look for a JSON pattern in the response
         json_pattern = r'\{.*\}'
         json_match = re.search(json_pattern, validation_result.content, re.DOTALL)
         
         if json_match:
             validation_json = json.loads(json_match.group())
         else:
-            # If JSON parsing fails, default to valid
             validation_json = {
-                "is_valid": True,  # Default to valid to avoid frustrating users
+                "is_valid": True,
                 "reason": "Could not determine validity",
                 "processed_response": response
             }
         
-        # Prepare feedback message if response is invalid
         feedback = None
         if not validation_json.get("is_valid", True):
             feedback = f"I notice your response doesn't seem to address my question about {expected_type}. {validation_json.get('reason', '')} Could you please provide more specific information?"
@@ -1778,18 +2017,9 @@ async def validate_response(question, response, expected_type):
         
     except Exception as e:
         print(f"Validation error: {str(e)}")
-        # Fall back to accepting the response to avoid blocking the conversation
         return {"is_valid": True, "feedback": None, "processed_response": response}
 
-# Add a helper function to identify multi-part questions and check completeness
 def validate_multi_part_response(question, response, expected_type):
-    """
-    Checks if a response answers all parts of a multi-part question
-    
-    Returns:
-        dict: with is_complete flag and missing_part information
-    """
-    # Define patterns for multi-part questions
     multi_part_patterns = {
         "previous_history": {
             "parts": ["Have you consulted a doctor", "what was their diagnosis"],
@@ -1803,22 +2033,18 @@ def validate_multi_part_response(question, response, expected_type):
         },
     }
     
-    # Check if we have a pattern for this type
     if expected_type not in multi_part_patterns:
         return {"is_complete": True}
     
     pattern = multi_part_patterns[expected_type]
     lower_response = response.lower()
     
-    # Check if any triggers are present
     has_trigger = any(trigger in lower_response for trigger in pattern["triggers"])
     
     if has_trigger:
-        # Check if any required follow-up is present
         has_follow_up = any(follow_up in lower_response for follow_up in pattern["required_follow_up"])
         
         if not has_follow_up:
-            # Determine which part needs to be answered based on the question pattern
             missing_part = pattern["parts"][1] if pattern["parts"][0] in question.lower() else pattern["parts"][0]
             return {
                 "is_complete": False,
@@ -1827,7 +2053,6 @@ def validate_multi_part_response(question, response, expected_type):
     
     return {"is_complete": True}
 
-# 3. Add a new "force_diagnosis" endpoint for users to explicitly request a diagnosis
 @app.post("/force_diagnosis")
 async def force_diagnosis(user_data_request: dict):
     try:
@@ -1839,7 +2064,6 @@ async def force_diagnosis(user_data_request: dict):
         if not user_data:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Check for emergency situations
         has_asthma = False
         lost_inhaler = False
         breathing_issues = False
@@ -1854,9 +2078,7 @@ async def force_diagnosis(user_data_request: dict):
                     if any(phrase in value.lower() for phrase in ["can't breathe", "cant breathe", "difficulty breathing"]):
                         breathing_issues = True
         
-        # If this is an asthma emergency, provide immediate response
         if has_asthma and (lost_inhaler or breathing_issues):
-            # Create an urgent HTML message for asthma attack
             urgent_html = f"""<div class="urgent-message">
 <div class="urgent-header">⚠️ URGENT ASTHMA EMERGENCY ⚠️</div>
 <div class="urgent-content">
@@ -1876,10 +2098,6 @@ async def force_diagnosis(user_data_request: dict):
                 "current_step": "emergency_services"
             }
         
-        # Standard diagnosis process continues as before...
-        # ... rest of the original function ...
-        
-        # Create state dict for diagnosis preparation
         state_dict = {
             "user_id": user_id,
             "response": "proceed to diagnosis",
@@ -1893,13 +2111,10 @@ async def force_diagnosis(user_data_request: dict):
             "current_step": "diagnosis_prep"
         }
         
-        # Process the diagnosis preparation step
         next_state = diagnosis_prep_handler(state_dict)
         
-        # Extract question (which will be the diagnosis)
         diagnosis = next_state.get("current_question", "Unable to generate diagnosis with current information")
         
-        # Update the user state
         update_user_data(user_id, "current_question", diagnosis)
         update_user_data(user_id, "current_step", "criticality")
         
