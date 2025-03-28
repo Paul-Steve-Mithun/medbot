@@ -87,7 +87,7 @@ def update_user_data(user_id: str, key: str, value: str, validation_details=None
     
     user_data_store[user_id] = user
 
-# Define state schema - simplified for clarity
+# Update the ChatState model to track urgency and custom conversation paths
 class ChatState(BaseModel):
     user_id: str
     response: Optional[str] = None
@@ -100,18 +100,41 @@ class ChatState(BaseModel):
     critical: Optional[bool] = False
     current_question: Optional[str] = None
     current_step: Optional[str] = "start"
+    # Add new fields for dynamic conversation
+    urgency_level: Optional[str] = "normal"  # "urgent", "normal", "low"
+    custom_path: Optional[str] = None  # Used to track specialized conversation paths
+    custom_context: Optional[dict] = {}  # Store context-specific data (e.g., foods for diarrhea)
     
     class Config:
         arbitrary_types_allowed = True
 
 # Helper function to ensure we're working with dictionaries
 def ensure_dict(state):
-    if isinstance(state, dict):
-        return state
-    elif isinstance(state, ChatState):
-        return state.dict()
+    """Ensure the state is a dictionary."""
+    if isinstance(state, ChatState):
+        state_dict = {
+            "user_id": state.user_id,
+            "response": state.response,
+            "is_existing": state.is_existing,
+            "symptoms": state.symptoms or [],
+            "previous_history": state.previous_history or "",
+            "medication_history": state.medication_history or "",
+            "additional_symptoms": state.additional_symptoms or "",
+            "diagnosis": state.diagnosis or "",
+            "critical": state.critical or False,
+            "current_question": state.current_question,
+            "current_step": state.current_step or "start",
+            "urgency_level": state.urgency_level or "normal",
+            "custom_path": state.custom_path,
+            "custom_context": state.custom_context or {}  # Initialize custom_context
+        }
+        return state_dict
     else:
-        raise ValueError(f"Unexpected state type: {type(state)}")
+        # If it's already a dict, make sure custom_context exists
+        if isinstance(state, dict):
+            if "custom_context" not in state:
+                state["custom_context"] = {}
+        return state
 
 # Ask question function for conversation flow
 def ask_question(state, question, key, next_step):
@@ -150,36 +173,16 @@ def start_node(state):
         
         if is_new_user:
             user_data_store[user_id] = user_data
-            state_dict["current_question"] = "Hello! I'm your medical assistant. Could you please describe your symptoms in detail?"
+            state_dict["current_question"] = "Hello! I'm your medical assistant. Could you please describe your symptoms or health concern in detail?"
         else:
-            state_dict["current_question"] = "Welcome back! How are you feeling today? Please describe your current symptoms in detail."
+            state_dict["current_question"] = "Welcome back! How are you feeling today? Please describe your current health concern in detail."
         
         # Set next step to be symptoms collection
-        state_dict["current_step"] = "symptoms"
+        state_dict["current_step"] = "initial_assessment"
         return state_dict
     
-    # Check if the response appears to be describing symptoms
-    # This helps differentiate between a proper symptom response and a greeting
-    symptoms_keywords = ["fever", "headache", "pain", "cough", "cold", "sick", "hurts", "ache", 
-                         "sore", "throat", "stomach", "nausea", "vomit", "dizzy", "tired", "fatigue"]
-    
-    lower_response = user_response.lower()
-    has_symptoms = any(keyword in lower_response for keyword in symptoms_keywords)
-    
-    if has_symptoms:
-        # User has provided symptoms in their initial response, proceed to symptom collection
-        update_user_data(user_id, "symptoms", user_response)
-        
-        # Next question about previous doctor consultation
-        state_dict["current_question"] = "Have you consulted a doctor about these symptoms before? If yes, what was their diagnosis?"
-        state_dict["current_step"] = "previous_history"
-    else:
-        # If the response doesn't contain recognizable symptoms, ask again for symptoms
-        update_user_data(user_id, "conversation_note", "User didn't provide clear symptoms in initial response")
-        state_dict["current_question"] = "To help you better, I need to understand your symptoms. Could you please describe what health issues you're experiencing?"
-        state_dict["current_step"] = "symptoms"
-    
-    return state_dict
+    # For responses to the greeting, perform the urgency assessment
+    return assess_initial_urgency(state)
 
 # Modify the conversation flow to strictly follow the steps
 # Each function should only handle one step and not skip ahead
@@ -356,44 +359,133 @@ def additional_symptoms_handler(state):
     state_dict["current_step"] = "criticality"
     return state_dict
 
-# Update the diagnosis prep handler for bullet-point format
+# Update the diagnosis_prep_handler function to create better formatted output
 def diagnosis_prep_handler(state):
     state_dict = ensure_dict(state)
     user_id = state_dict["user_id"]
     
-    # This function should directly generate the diagnosis and return it
+    # Initialize custom_context if not present
+    if "custom_context" not in state_dict:
+        state_dict["custom_context"] = {}
+    
+    # Create a local variable for easier access
+    custom_context = state_dict["custom_context"]
+    
+    # Get user data
     user_data = get_user_data(user_id)
     
-    # Generate diagnosis
-    symptoms_text = ", ".join(user_data.symptoms)
-    prev_history = user_data.previous_history
-    med_history = user_data.medication_history
-    add_symptoms = user_data.additional_symptoms
+    # Check for critical health conditions first
+    has_asthma = False
+    lost_inhaler = False
+    breathing_issues = False
     
-    diagnosis_prompt = f"""Based on the following patient information, provide a detailed diagnosis:
+    for item in user_data.history:
+        for key, value in item.items():
+            if isinstance(value, str):
+                if "asthma" in value.lower():
+                    has_asthma = True
+                if "lost" in value.lower() and "inhaler" in value.lower():
+                    lost_inhaler = True
+                if any(phrase in value.lower() for phrase in ["can't breathe", "cant breathe", "difficulty breathing"]):
+                    breathing_issues = True
     
-    Symptoms: {symptoms_text}
-    Previous Medical History: {prev_history}
-    Medication History: {med_history}
-    Additional Symptoms: {add_symptoms}
+    # Extract all user inputs to create a comprehensive patient history
+    all_inputs = []
+    for item in user_data.history:
+        for key, value in item.items():
+            # Only include user responses, not system messages or questions
+            if key in ["symptoms", "previous_history", "medication_history", "additional_symptoms", "response"]:
+                if isinstance(value, str) and len(value) > 3 and "continue" not in value.lower():
+                    all_inputs.append(value)
     
-    Format your diagnosis as a clear bulleted list with:
-    - Most likely condition(s)
-    - Brief explanation for each condition
-    - Key symptoms supporting this diagnosis
+    # Create a comprehensive patient description
+    patient_description = "\n".join(all_inputs)
     
-    Use bullet points (•) for main points and sub-bullets (-) for details.
+    # Enhanced diagnosis prompt that focuses on relevant conditions
+    diagnosis_prompt = f"""
+    You are a medical AI assistant providing a preliminary analysis of a patient's symptoms.
+    Based on the following patient description, provide a focused, relevant diagnosis:
+    
+    {patient_description}
+    
+    IMPORTANT: Your diagnosis must:
+    1. Be DIRECTLY RELEVANT to the symptoms actually mentioned by the patient
+    2. Focus on the most likely condition based on their specific description
+    3. Provide actionable advice that addresses their particular situation
+    4. Be clear, concise, and formatted for easy reading
+    
+    Format your response with these EXACT headings:
+    
+    ## LIKELY CONDITION
+    [Provide the most likely condition and a brief explanation - 2-3 sentences maximum]
+    
+    ## ACTION STEPS
+    • [First action step - specific and relevant to this condition]
+    • [Second action step]
+    • [Third action step if necessary]
+    
+    ## NOTE
+    [A brief note about when to consult a doctor - 1 sentence]
+    
+    DO NOT include generic advice that isn't directly related to the patient's specific symptoms.
     """
     
     diagnosis = llm.invoke(diagnosis_prompt)
     update_user_data(user_id, "diagnosis", diagnosis.content)
     
-    # Set the diagnosis as the current question and move to criticality step
-    state_dict["current_question"] = diagnosis.content
+    # Format the diagnosis as HTML for better presentation
+    diagnosis_text = diagnosis.content.strip()
+    
+    # Extract sections
+    condition_section = ""
+    action_steps = []
+    note = "Consult a doctor if symptoms worsen or persist."
+    
+    # Parse the diagnosis content into sections
+    if "LIKELY CONDITION" in diagnosis_text:
+        parts = diagnosis_text.split("##")
+        for part in parts:
+            if "LIKELY CONDITION" in part:
+                condition_section = part.replace("LIKELY CONDITION", "").strip()
+            elif "ACTION STEPS" in part:
+                actions_text = part.replace("ACTION STEPS", "").strip()
+                action_steps = [step.strip().replace("•", "").strip() for step in actions_text.split("\n") if step.strip() and "•" in step]
+                if not action_steps:  # If bullet extraction failed, try line by line
+                    action_steps = [line.strip() for line in actions_text.split("\n") if line.strip() and not line.strip().startswith("##")]
+            elif "NOTE" in part:
+                note = part.replace("NOTE", "").strip()
+    
+    # If parsing failed, extract at least something
+    if not condition_section:
+        condition_section = "Unable to determine specific condition from symptoms provided"
+    
+    if not action_steps:
+        action_steps = ["Rest and stay hydrated", "Monitor your symptoms", "Consult with a healthcare professional"]
+    
+    # Create HTML formatted diagnosis
+    formatted_html = f"""<div class="diagnosis-card">
+  <div class="diagnosis-header">LIKELY CONDITION</div>
+  <div class="diagnosis-content">{condition_section}</div>
+  
+  <div class="diagnosis-header">ACTION STEPS</div>
+  <ul class="diagnosis-list">"""
+    
+    # Add each action step
+    for step in action_steps:
+        formatted_html += f"\n    <li>{step}</li>"
+    
+    formatted_html += f"""
+  </ul>
+  
+  <div class="diagnosis-header">NOTE</div>
+  <div class="diagnosis-note">{note}</div>
+</div>"""
+    
+    state_dict["current_question"] = formatted_html
     state_dict["current_step"] = "criticality"
     return state_dict
 
-# Update the generate_diagnosis function for bullet-point format
+# Update the generate_diagnosis function with the same improved format
 def generate_diagnosis(state):
     state_dict = ensure_dict(state)
     user_id = state_dict["user_id"]
@@ -405,29 +497,68 @@ def generate_diagnosis(state):
     med_history = user_data.medication_history
     add_symptoms = user_data.additional_symptoms
     
-    diagnosis_prompt = f"""Based on the following patient information, provide a detailed diagnosis:
+    diagnosis_prompt = f"""
+    Based on the following patient information, provide a concise, patient-friendly diagnosis:
     
     Symptoms: {symptoms_text}
     Previous Medical History: {prev_history}
     Medication History: {med_history}
     Additional Symptoms: {add_symptoms}
     
-    Format your diagnosis as a clear bulleted list with:
-    • Most likely condition(s)
-    • Brief explanation for each condition
-    • Key symptoms supporting this diagnosis
+    Requirements:
+    1. Keep the diagnosis clear, concise, and easy to read
+    2. Use no more than 2-3 paragraphs total
+    3. If multiple conditions are possible, only mention the 1-2 most likely ones
+    4. Include specific, practical recommendations for the patient
+    5. For common conditions, include widely recognized first-aid or home care advice
     
-    Use bullet points (•) for main points and sub-bullets (-) for details.
+    Format your response in THREE sections with these EXACT headings:
+    
+    ## LIKELY CONDITION
+    [Brief, simple explanation of the most likely diagnosis in 2-3 sentences]
+    
+    ## ACTION STEPS
+    • [First immediate action the patient should take]
+    • [Whether and when to seek medical attention]
+    • [Specific home care recommendations if applicable]
+    
+    ## MEDICAL NOTE
+    [A brief medical disclaimer that this is not a complete diagnosis]
+    
+    For common urgent conditions, include standard medical recommendations:
+    - Heart attack: Take aspirin if not allergic, call emergency services
+    - Burns: Cool with water, don't apply butter/oil, cover with clean cloth
+    - Cuts: Apply pressure, clean with water, use sterile bandage
+    - Diabetes crisis: Check blood sugar, take insulin as prescribed, call doctor
+    - Asthma attack: Use rescue inhaler, sit upright, seek help if not improving
     """
     
     diagnosis = llm.invoke(diagnosis_prompt)
     update_user_data(user_id, "diagnosis", diagnosis.content)
     
-    state_dict["current_question"] = diagnosis.content
+    # Format the diagnosis as HTML
+    formatted_html = f"""<div class="diagnosis-card">
+  <div class="diagnosis-header">LIKELY CONDITION</div>
+  <div class="diagnosis-content">
+    {diagnosis.content.split("ACTION STEPS")[0].strip()}
+  </div>
+  
+  <div class="diagnosis-header">ACTION STEPS</div>
+  <ul class="diagnosis-list">
+    <li>Rest more</li>
+    <li>Drink plenty of fluids</li>
+    <li>Take over-the-counter medication for symptoms</li>
+  </ul>
+  
+  <div class="diagnosis-header">NOTE</div>
+  <div class="diagnosis-note">Consult a doctor if symptoms worsen or don't improve within a few days.</div>
+</div>"""
+    
+    state_dict["current_question"] = formatted_html
     state_dict["current_step"] = "criticality"
     return state_dict
 
-# Criticality assessment
+# Criticality assessment with improved formatting
 def assess_criticality(state):
     state_dict = ensure_dict(state)
     user_id = state_dict["user_id"]
@@ -446,33 +577,33 @@ def assess_criticality(state):
     Medication History: {med_history}
     Diagnosis: {diagnosis}
     
-    Assess the urgency/severity of this condition. 
-    1. Is immediate medical attention required? Answer only 'yes' or 'no'.
-    2. When should the patient see a doctor? (immediately, within 24 hours, within a week, routine appointment)
-    3. What precautions should the patient take in the meantime?
+    Provide a clear assessment of urgency and recommendations.
     
-    Format your response as:
-    Urgency: Yes/No
-    Timeframe: [timeframe]
-    Precautions: [brief list of precautions]
+    Format your response with EXACTLY these sections:
+    
+    ## URGENCY LEVEL
+    [State whether this is URGENT (needs immediate care), PROMPT (see doctor soon), or ROUTINE]
+    
+    ## TIMEFRAME
+    [When the patient should see a doctor: immediately, within 24 hours, within a week, or at their convenience]
+    
+    ## PRECAUTIONS
+    • [First precaution as a bullet point]
+    • [Second precaution as a bullet point]
+    • [Third precaution as a bullet point if applicable]
+    
+    ## DISCLAIMER
+    [A brief medical disclaimer that this is not a substitute for professional care]
     """
     
     assessment = llm.invoke(criticality_prompt)
     assessment_text = assessment.content
     
-    # Extract urgency
-    is_critical = "urgency: yes" in assessment_text.lower()
+    # Extract urgency (looking for the word URGENT in the urgency level section)
+    is_critical = "URGENT" in assessment_text
     update_user_data(user_id, "critical", "yes" if is_critical else "no")
     
-    # Format final response with recommendations
-    final_response = f"""Based on your information, here's my assessment:
-
-{assessment_text}
-
-DISCLAIMER: This is not a substitute for professional medical advice. Always consult with a qualified healthcare provider for proper diagnosis and treatment.
-"""
-    
-    state_dict["current_question"] = final_response
+    state_dict["current_question"] = assessment_text
     state_dict["current_step"] = "end"
     return state_dict
 
@@ -520,10 +651,443 @@ def generate_summary(state):
     summary = llm.invoke(summary_prompt)
     return {"summary": f"## Medical Case Summary\n\n{summary.content}"}
 
+# Update function to specifically handle accidents
+def assess_initial_urgency(state):
+    state_dict = ensure_dict(state)
+    
+    # Make sure custom_context is initialized
+    if "custom_context" not in state_dict:
+        state_dict["custom_context"] = {}
+    
+    user_id = state_dict["user_id"]
+    user_response = state_dict.get("response", "")
+    
+    # ACCIDENT DETECTION: Explicitly check for accident-related phrases
+    accident_keywords = ["accident", "crash", "fell", "injured", "hit", "collision", "car accident"]
+    if any(keyword in user_response.lower() for keyword in accident_keywords):
+        # Set high urgency for accidents
+        state_dict["urgency_level"] = "urgent"
+        state_dict["custom_path"] = "injury_assessment"
+        state_dict["custom_context"] = {
+            "category": "injury",
+            "key_symptoms": ["accident", "injury"],
+            "reasoning": "Patient mentioned being in an accident"
+        }
+        
+        # Store the accident information
+        update_user_data(user_id, "accident_info", user_response)
+        update_user_data(user_id, "symptoms", "accident injury")
+        
+        # Generate specific questions for accidents
+        accident_prompt = f"""
+        The patient has said: "{user_response}"
+        
+        They have mentioned being in an accident. Ask them specific questions to:
+        1. Determine if there's any bleeding, head injury, or severe pain
+        2. Find out if they can move all limbs
+        3. Check if they've lost consciousness at any point
+        4. Determine if emergency services were called
+        
+        Format as 2-3 clear questions that assess the urgency of their injuries.
+        """
+        
+        accident_questions = llm.invoke(accident_prompt)
+        
+        # Format the emergency message with bold numbered points
+        state_dict["current_question"] = f"""<div class="urgent-message">
+<div class="urgent-header">⚠️ URGENT MEDICAL SITUATION ⚠️</div>
+<div class="urgent-content">
+  <p><strong>1.</strong> Call 911 immediately</p>
+  <p><strong>2.</strong> Stay calm and seated</p>
+  <p><strong>3.</strong> Take aspirin if available</p>
+  <p><strong>4.</strong> Loosen tight clothing</p>
+</div>
+<div class="urgent-footer">If this is life-threatening, stop using this app and call emergency services (911) immediately.</div>
+</div>"""
+        
+        state_dict["current_step"] = "urgent_follow_up"
+        return state_dict
+    
+    # Check for known chronic conditions first
+    chronic_conditions = ["diabetes", "diabetic", "hypertension", "asthma", "copd", "arthritis", "thyroid"]
+    mentioned_conditions = [c for c in chronic_conditions if c in user_response.lower()]
+    
+    if mentioned_conditions:
+        # Create a customized follow-up for chronic conditions
+        condition = mentioned_conditions[0]  # Use the first mentioned condition
+        
+        # Store the condition information
+        state_dict["urgency_level"] = "routine"
+        state_dict["custom_path"] = "chronic_condition"
+        state_dict["custom_context"] = {
+            "category": "chronic",
+            "key_symptoms": [condition],
+            "reasoning": f"Patient mentioned {condition}, which is a chronic condition"
+        }
+        
+        # Store condition in user data
+        update_user_data(user_id, "medical_condition", condition)
+        update_user_data(user_id, "symptoms", condition)
+        
+        # Generate condition-specific follow-up
+        condition_questions = {
+            "diabetes": "Thank you for sharing that you have diabetes. Is this Type 1 or Type 2 diabetes? And are you experiencing any specific issues related to your condition right now?",
+            "diabetic": "Thank you for mentioning you're diabetic. Is this Type 1 or Type 2 diabetes? And are you experiencing any specific issues related to your condition right now?",
+            "hypertension": "Thank you for letting me know about your hypertension. Are you currently experiencing any symptoms like headache, dizziness, or chest pain?",
+            "asthma": "Thank you for sharing that you have asthma. Are you currently experiencing any breathing difficulties or increased use of your rescue inhaler?"
+        }
+        
+        # Set specific question based on condition, or use a generic one
+        state_dict["current_question"] = condition_questions.get(
+            condition, 
+            f"Thank you for sharing that you have {condition}. Could you tell me more about any current symptoms or concerns related to your condition?"
+        )
+        
+        state_dict["current_step"] = "chronic_condition"
+        return state_dict
+    
+    # Create a prompt to evaluate urgency
+    urgency_prompt = f"""
+    Based on the following patient description, assess the medical urgency:
+    
+    Patient description: "{user_response}"
+    
+    Rate the urgency as:
+    1. URGENT - requires immediate medical attention (bleeding, trouble breathing, severe injury)
+    2. PROMPT - should be addressed soon but not an emergency
+    3. ROUTINE - standard medical concern
+    
+    Also identify the primary medical issue category (e.g., injury, infection, chronic condition).
+    Explain your reasoning briefly.
+    
+    Format your response as JSON:
+    {{
+        "urgency_level": "URGENT/PROMPT/ROUTINE",
+        "category": "primary medical issue category",
+        "reasoning": "brief explanation",
+        "key_symptoms": ["symptom1", "symptom2"],
+        "recommended_questions": ["question1", "question2"]
+    }}
+    """
+    
+    urgency_assessment = llm.invoke(urgency_prompt)
+    
+    # Extract JSON from the response
+    import json
+    import re
+    
+    json_pattern = r'\{.*\}'
+    json_match = re.search(json_pattern, urgency_assessment.content, re.DOTALL)
+    
+    if json_match:
+        try:
+            assessment = json.loads(json_match.group())
+        except:
+            # Default assessment if JSON parsing fails
+            assessment = {
+                "urgency_level": "ROUTINE",
+                "category": "general",
+                "reasoning": "Unable to determine urgency from description",
+                "key_symptoms": [],
+                "recommended_questions": []
+            }
+    else:
+        # Default assessment if JSON parsing fails
+        assessment = {
+            "urgency_level": "ROUTINE",
+            "category": "general",
+            "reasoning": "Unable to determine urgency from description",
+            "key_symptoms": [],
+            "recommended_questions": []
+        }
+    
+    # Update the state with urgency assessment
+    state_dict["urgency_level"] = assessment["urgency_level"].lower()
+    state_dict["custom_context"] = {
+        "category": assessment.get("category", "general"),
+        "key_symptoms": assessment.get("key_symptoms", []),
+        "reasoning": assessment.get("reasoning", "")
+    }
+    
+    # Store the assessment in user data
+    update_user_data(user_id, "urgency_assessment", json.dumps(assessment))
+    
+    # For URGENT cases, create a simpler message without relying on markdown
+    if assessment.get("urgency_level") == "URGENT":
+        urgent_advice_prompt = f"""
+        The patient has described: "{user_response}"
+        
+        Based on this information, provide 4 urgent first aid steps for this
+        medical situation. Format as a simple numbered list with only the most critical
+        steps to take immediately.
+        
+        Example format:
+        1. Call emergency services
+        2. Specific action to take
+        3. Another critical action
+        4. Final immediate instruction
+        """
+        
+        urgent_advice = llm.invoke(urgent_advice_prompt)
+        
+        # Format the emergency message with the entire advice content
+        state_dict["current_question"] = f"""<div class="urgent-message">
+<div class="urgent-header">⚠️ URGENT MEDICAL GUIDANCE ⚠️</div>
+<div class="urgent-content">
+  {urgent_advice.content}
+</div>
+<div class="urgent-footer">If this is life-threatening, stop using this app and call emergency services (911) immediately.</div>
+</div>"""
+        
+        state_dict["current_step"] = "urgent_follow_up"
+        return state_dict
+    
+    # For less urgent cases, generate dynamic personalized questions
+    next_questions_prompt = f"""
+    The patient has described: "{user_response}"
+    
+    Based on this information and the medical category identified ({assessment.get("category", "general")}),
+    generate the most relevant next question to ask.
+    
+    Consider:
+    1. The specific symptoms described ({', '.join(assessment.get("key_symptoms", []))})
+    2. The urgency level ({assessment.get("urgency_level", "ROUTINE")})
+    3. What additional information would help most with diagnosis
+    
+    Your question should be tailored to the specific medical situation, not generic.
+    For example, if they mentioned diarrhea, ask about recent food consumption and travel.
+    
+    Format your response as a direct question to the patient.
+    """
+    
+    next_question = llm.invoke(next_questions_prompt)
+    
+    # Set dynamic question and create a custom conversation path
+    state_dict["current_question"] = next_question.content
+    
+    # Choose appropriate next step based on category
+    category_to_path = {
+        "injury": "injury_assessment",
+        "infection": "infection_assessment",
+        "digestive": "digestive_assessment",
+        "respiratory": "respiratory_assessment",
+        "chronic": "chronic_condition",
+        # Add more mappings as needed
+    }
+    
+    # Set custom path or default to symptoms collection
+    category = assessment.get("category", "").lower()
+    if category in category_to_path:
+        state_dict["custom_path"] = category_to_path[category]
+        state_dict["current_step"] = category_to_path[category]
+    else:
+        state_dict["current_step"] = "dynamic_symptoms"
+    
+    return state_dict
+
+# Add a generic dynamic follow-up question handler
+def dynamic_follow_up_handler(state):
+    state_dict = ensure_dict(state)
+    
+    # Make sure custom_context is initialized
+    if "custom_context" not in state_dict:
+        state_dict["custom_context"] = {}
+    
+    user_id = state_dict["user_id"]
+    user_response = state_dict.get("response", "")
+    current_context = state_dict.get("custom_context", {})
+    current_step = state_dict.get("current_step", "dynamic_symptoms")
+    
+    # Save the user's response in the appropriate category
+    update_user_data(user_id, current_step, user_response)
+    
+    # Update context with new information
+    current_context["last_response"] = user_response
+    
+    # ADDED: Track conversation turn count for this handler
+    if "turn_count" not in current_context:
+        current_context["turn_count"] = 1
+    else:
+        current_context["turn_count"] = current_context["turn_count"] + 1
+    
+    # ADDED: Force diagnosis after a maximum number of turns (4-5 is usually sufficient)
+    if current_context["turn_count"] >= 4:
+        state_dict["custom_context"] = current_context
+        state_dict["current_question"] = "Thank you for all this information. I have enough details now to analyze your situation and provide a preliminary diagnosis."
+        state_dict["current_step"] = "diagnosis_prep"
+        return state_dict
+    
+    # Get all previous responses to build context
+    user_data = get_user_data(user_id)
+    conversation_history = [
+        f"Patient: {item.get(key, '')}" 
+        for item in user_data.history 
+        for key in item 
+        if key not in ["current_question", "current_step", "validation", "validation_details"]
+    ]
+    
+    # Create a prompt for generating the next question based on all previous information
+    next_question_prompt = f"""
+    Patient history:
+    {conversation_history[-5:] if len(conversation_history) > 5 else conversation_history}
+    
+    Latest response: "{user_response}"
+    
+    Current medical category: {current_context.get("category", "general medical issue")}
+    Key symptoms identified: {', '.join(current_context.get("key_symptoms", []))}
+    Urgency level: {state_dict.get("urgency_level", "normal")}
+    Turn count: {current_context["turn_count"]}
+    
+    Based on all this information, what is the most relevant next question to ask?
+    Consider what additional information would be most valuable for diagnosis.
+    
+    IMPORTANT: If we now have enough information OR we've asked {current_context["turn_count"]} questions already, 
+    indicate that we should move to diagnosis.
+    
+    Generate a personalized follow-up question that naturally continues this specific medical conversation.
+    DO NOT ask generic questions that don't relate to their specific condition.
+    
+    Format your response as JSON:
+    {{
+        "next_question": "your specific follow-up question",
+        "move_to_diagnosis": true/false,
+        "reasoning": "brief explanation why we should/shouldn't move to diagnosis",
+        "additional_context": {{
+            "key": "value" // any additional context to track
+        }}
+    }}
+    """
+    
+    response = llm.invoke(next_question_prompt)
+    
+    # Extract JSON from the response
+    import json
+    import re
+    
+    json_pattern = r'\{.*\}'
+    json_match = re.search(json_pattern, response.content, re.DOTALL)
+    
+    if json_match:
+        try:
+            follow_up = json.loads(json_match.group())
+        except:
+            follow_up = {
+                "next_question": "Could you tell me more about your symptoms?",
+                "move_to_diagnosis": False,
+                "reasoning": "Could not determine validity",
+                "additional_context": {}
+            }
+    else:
+        # Default if JSON parsing fails
+        follow_up = {
+            "next_question": "Could you tell me more about your symptoms?",
+            "move_to_diagnosis": False,
+            "reasoning": "Could not determine validity",
+            "additional_context": {}
+        }
+    
+    # Update context with new information
+    if "additional_context" in follow_up and follow_up["additional_context"]:
+        current_context.update(follow_up["additional_context"])
+    
+    state_dict["custom_context"] = current_context
+    
+    # Check if we should move to diagnosis or continue gathering information
+    if follow_up.get("move_to_diagnosis", False):
+        # We have enough information for diagnosis
+        state_dict["current_question"] = "Thank you for all this information. I'll now analyze your symptoms and provide a preliminary diagnosis."
+        state_dict["current_step"] = "diagnosis_prep"
+    else:
+        # Continue with dynamic questioning
+        state_dict["current_question"] = follow_up["next_question"]
+        
+        # Determine if we should change the path based on new information
+        if "path_update" in follow_up:
+            state_dict["custom_path"] = follow_up["path_update"]
+            state_dict["current_step"] = follow_up["path_update"]
+        else:
+            # Stay on current path but advance the step number
+            state_dict["current_step"] = f"{current_step}_continued"
+    
+    return state_dict
+
+# Add handlers for urgent situations
+def urgent_follow_up_handler(state):
+    state_dict = ensure_dict(state)
+    user_id = state_dict["user_id"]
+    user_response = state_dict.get("response", "")
+    
+    update_user_data(user_id, "urgent_follow_up", user_response)
+    
+    # Get user data to provide context
+    user_data = get_user_data(user_id)
+    
+    # Extract all relevant inputs to understand the patient's situation
+    all_inputs = []
+    for item in user_data.history:
+        for key, value in item.items():
+            if key in ["symptoms", "previous_history", "medication_history", "additional_symptoms", "response"]:
+                if isinstance(value, str) and len(value) > 3:
+                    all_inputs.append(value)
+    
+    # Create a comprehensive patient description
+    patient_description = "\n".join(all_inputs)
+    
+    # Generate urgency-specific prompt based on the actual medical situation
+    prompt = f"""
+    Based on this patient's information:
+    
+    {patient_description}
+    
+    Provide 4 SPECIFIC emergency first aid steps that are directly relevant to their condition.
+    These should be clear, actionable instructions that address their urgent medical situation.
+    
+    Format your response as 4 numbered steps, each being a concise, direct instruction.
+    """
+    
+    urgent_advice = llm.invoke(prompt)
+    
+    # Parse the response to extract specific steps
+    advice_text = urgent_advice.content
+    
+    # Define default steps in case parsing fails
+    default_steps = [
+        "Call emergency services (911) immediately",
+        "Sit upright and try to stay calm",
+        "Remove any restrictive clothing",
+        "Breathe slowly through pursed lips"
+    ]
+    
+    # Try to extract numbered steps
+    import re
+    numbered_steps = re.findall(r'\d+\.\s*(.*?)(?=\d+\.|$)', advice_text, re.DOTALL)
+    
+    # Use extracted steps if available, otherwise use defaults
+    steps = [step.strip() for step in numbered_steps if step.strip()] if len(numbered_steps) >= 3 else default_steps
+    
+    # Ensure we have exactly 4 steps
+    while len(steps) < 4:
+        steps.append(default_steps[len(steps)])
+    
+    # Format the emergency message with properly structured HTML
+    state_dict["current_question"] = f"""<div class="urgent-message">
+<div class="urgent-header">⚠️ URGENT MEDICAL SITUATION ⚠️</div>
+<div class="urgent-content">
+  <p><strong>1.</strong> {steps[0]}</p>
+  <p><strong>2.</strong> {steps[1]}</p>
+  <p><strong>3.</strong> {steps[2]}</p>
+  <p><strong>4.</strong> {steps[3]}</p>
+</div>
+<div class="urgent-footer">If this is life-threatening, stop using this app and call emergency services (911) immediately.</div>
+</div>"""
+    
+    state_dict["current_step"] = "emergency_services"
+    return state_dict
+
 # Define the graph with updated nodes and flow
 graph = StateGraph(state_schema=ChatState)
 
-# Define nodes with clear separate steps
+# Define nodes with dynamic capabilities
 graph.add_node("start", start_node)
 graph.add_node("collect_symptoms", collect_symptoms_handler)
 graph.add_node("prev_history_node", previous_history_handler)
@@ -534,11 +1098,53 @@ graph.add_node("diagnosis_node", generate_diagnosis)
 graph.add_node("criticality_node", assess_criticality)
 graph.add_node("summary_node", generate_summary)
 
-# Connect from the START constant to your first node
-graph.add_edge(START, "start")
+# Add new dynamic nodes
+graph.add_node("initial_assessment", assess_initial_urgency)
+graph.add_node("dynamic_symptoms", dynamic_follow_up_handler)
+graph.add_node("injury_assessment", dynamic_follow_up_handler)
+graph.add_node("infection_assessment", dynamic_follow_up_handler)
+graph.add_node("digestive_assessment", dynamic_follow_up_handler)
+graph.add_node("respiratory_assessment", dynamic_follow_up_handler)
+graph.add_node("chronic_condition", dynamic_follow_up_handler)
+graph.add_node("urgent_follow_up", urgent_follow_up_handler)
+graph.add_node("emergency_services", urgent_follow_up_handler)
 
-# Then keep your other edges as they are
-graph.add_edge("start", "collect_symptoms")
+# Connect nodes with flexible flow
+graph.add_edge(START, "start")
+graph.add_edge("start", "initial_assessment")
+
+# Connect initial assessment to different paths
+graph.add_edge("initial_assessment", "dynamic_symptoms")
+graph.add_edge("initial_assessment", "injury_assessment")
+graph.add_edge("initial_assessment", "infection_assessment")
+graph.add_edge("initial_assessment", "digestive_assessment")
+graph.add_edge("initial_assessment", "respiratory_assessment")
+graph.add_edge("initial_assessment", "chronic_condition")
+graph.add_edge("initial_assessment", "urgent_follow_up")
+
+# Connect dynamic symptom collectors to themselves for continuation
+graph.add_edge("dynamic_symptoms", "dynamic_symptoms")
+graph.add_edge("injury_assessment", "injury_assessment")
+graph.add_edge("infection_assessment", "infection_assessment")
+graph.add_edge("digestive_assessment", "digestive_assessment")
+graph.add_edge("respiratory_assessment", "respiratory_assessment")
+graph.add_edge("chronic_condition", "chronic_condition")
+
+# Connect urgent paths
+graph.add_edge("urgent_follow_up", "emergency_services")
+graph.add_edge("emergency_services", "emergency_services")
+
+# Connect all paths to diagnosis
+graph.add_edge("dynamic_symptoms", "diagnosis_prep")
+graph.add_edge("injury_assessment", "diagnosis_prep") 
+graph.add_edge("infection_assessment", "diagnosis_prep")
+graph.add_edge("digestive_assessment", "diagnosis_prep")
+graph.add_edge("respiratory_assessment", "diagnosis_prep")
+graph.add_edge("chronic_condition", "diagnosis_prep")
+graph.add_edge("urgent_follow_up", "diagnosis_prep")
+graph.add_edge("emergency_services", "diagnosis_prep")
+
+# Connect original nodes for backward compatibility
 graph.add_edge("collect_symptoms", "prev_history_node")
 graph.add_edge("prev_history_node", "med_history_node")
 graph.add_edge("med_history_node", "additional_symptoms_node")
@@ -555,6 +1161,39 @@ async def chat(user_response: UserResponse):
     try:
         print(f"Received request: {user_response}")
         user_id = user_response.user_id
+        
+        # ADDED: Special handling for "get_diagnosis" token to force diagnosis generation
+        if user_response.response in ["get_diagnosis", "provide diagnosis", "diagnose"]:
+            # Create a state object for diagnosis
+            user = get_user_data(user_id)
+            state_dict = {
+                "user_id": user_id,
+                "response": "proceed to diagnosis",
+                "is_existing": True,
+                "symptoms": user.symptoms,
+                "previous_history": user.previous_history,
+                "medication_history": user.medication_history,
+                "additional_symptoms": user.additional_symptoms,
+                "diagnosis": user.diagnosis,
+                "critical": user.critical,
+                "current_step": "diagnosis_prep"
+            }
+            
+            # Ensure state has custom_context initialized
+            if "custom_context" not in state_dict:
+                state_dict["custom_context"] = {}
+            
+            # Process through diagnosis_prep
+            next_state = diagnosis_prep_handler(state_dict)
+            
+            # Extract and return
+            question = next_state.get("current_question", "Unable to generate diagnosis with current information")
+            
+            # Store the updated state
+            update_user_data(user_id, "current_question", question)
+            update_user_data(user_id, "current_step", "criticality")
+            
+            return {"next_question": question, "current_step": "criticality"}
         
         # Special handling for "continue" token to always proceed to next step
         if user_response.response == "continue":
@@ -599,8 +1238,28 @@ async def chat(user_response: UserResponse):
         # Check if this is a first-time interaction with this user
         is_first_interaction = user_id not in user_data_store
         
-        # Check if we have a persistent state for this user
-        if not is_first_interaction:
+        # MAJOR FIX: Create the user record FIRST and process their input
+        if is_first_interaction:
+            # Initialize new user in data store
+            user_data_store[user_id] = UserData(user_id=user_id)
+            
+            # Store their initial response as a symptom/issue
+            update_user_data(user_id, "symptoms", user_response.response)
+            
+            # Create state dictionary with the actual user response
+            state_dict = {
+                "user_id": user_id,
+                "response": user_response.response,  # <-- CRITICAL FIX: Use their actual response
+                "is_existing": False,
+                "symptoms": [user_response.response],
+                "previous_history": None,
+                "medication_history": None,
+                "additional_symptoms": None,
+                "diagnosis": None,
+                "critical": False,
+                "current_step": "initial_assessment"  # Go directly to assessment
+            }
+        else:
             # Get existing user
             user = user_data_store[user_id]
             
@@ -677,42 +1336,6 @@ async def chat(user_response: UserResponse):
                 last_user_response = next((item.get("response") for item in reversed(user.history) 
                                           if "response" in item), "")
                 state_dict["response"] = last_user_response
-            
-        else:
-            # FIXED PART: New user with initial symptoms - bypass the greeting and go straight to processing
-            # Create a new user and process their first response as symptoms
-            user_data_store[user_id] = UserData(user_id=user_id)
-            
-            # Check if the first message contains symptoms
-            symptoms_keywords = ["fever", "headache", "pain", "cough", "cold", "sick", "hurts", "ache", 
-                               "sore", "throat", "stomach", "nausea", "vomit", "dizzy", "tired", "fatigue"]
-            
-            initial_response_has_symptoms = any(keyword in user_response.response.lower() for keyword in symptoms_keywords)
-            
-            if initial_response_has_symptoms:
-                # If symptoms are found in the first message, process them and move to previous history
-                update_user_data(user_id, "symptoms", user_response.response)
-                
-                # Skip the greeting, go directly to the next step
-                return {
-                    "next_question": "Have you consulted a doctor about these symptoms before? If yes, what was their diagnosis?",
-                    "current_step": "previous_history"
-                }
-            else:
-                # If no symptoms in first message, start fresh with a greeting
-                state_dict = {
-                    "user_id": user_id,
-                    "response": "",  # Empty response to trigger greeting
-                    "is_existing": False,
-                    "symptoms": [],
-                    "previous_history": None,
-                    "medication_history": None,
-                    "additional_symptoms": None,
-                    "diagnosis": None,
-                    "critical": False,
-                    "current_question": None,
-                    "current_step": "start"
-                }
         
         print(f"Processing state: {state_dict}")
         
@@ -748,10 +1371,29 @@ async def chat(user_response: UserResponse):
 # Helper function to determine the next step based on the current step
 def determine_next_step(state):
     current_step = state.get("current_step", "start")
+    custom_path = state.get("custom_path")
     
-    # Define the conversation flow
+    # If we have a custom path, prioritize it
+    if custom_path:
+        return custom_path
+    
+    # For steps that end with "_continued", keep using the dynamic handler
+    if current_step.endswith("_continued"):
+        base_step = current_step.replace("_continued", "")
+        return base_step
+    
+    # Define the conversation flow including dynamic steps
     step_flow = {
         "start": "start",
+        "initial_assessment": "initial_assessment",
+        "dynamic_symptoms": "dynamic_symptoms",
+        "injury_assessment": "injury_assessment",
+        "infection_assessment": "infection_assessment",
+        "digestive_assessment": "digestive_assessment",
+        "respiratory_assessment": "respiratory_assessment",
+        "chronic_condition": "chronic_condition",
+        "urgent_follow_up": "urgent_follow_up",
+        "emergency_services": "emergency_services",
         "symptoms": "collect_symptoms",
         "previous_history": "prev_history_node",
         "medication_history": "med_history_node",
@@ -762,30 +1404,54 @@ def determine_next_step(state):
         "end": "end"
     }
     
-    return step_flow.get(current_step, "start")
+    return step_flow.get(current_step, "initial_assessment")
 
 # Process a specific step in the conversation
 def process_step(step_name, state):
     state_dict = ensure_dict(state)
     
+    # Make sure custom_context is initialized
+    if "custom_context" not in state_dict:
+        state_dict["custom_context"] = {}
+    
+    # ADDED: Check for repetitive conversation patterns and force progression
+    if step_name.endswith("_continued") and "_continued_continued" in step_name:
+        # If we see nested continuations, it's time to move to diagnosis
+        print(f"Detected nested continuations in {step_name}, forcing diagnosis")
+        state_dict["current_question"] = "I believe I have sufficient information now. Let me provide a preliminary diagnosis based on what you've shared."
+        state_dict["current_step"] = "diagnosis_prep"
+        return diagnosis_prep_handler(state_dict)
+    
+    # Add special handling for first-time accident reports
+    if step_name == "initial_assessment" and state_dict.get("response", "").lower() and "accident" in state_dict.get("response", "").lower():
+        # Force this to go through accident assessment
+        return assess_initial_urgency(state_dict)
+    
     # Special cases for steps that should auto-progress
     if step_name == "diagnosis_prep":
-        # Skip the intermediate step and directly generate diagnosis
         return diagnosis_prep_handler(state_dict)
     elif step_name == "additional_symptoms_node":
-        # Handle the additional_symptoms node specially to auto-progress to diagnosis
         return additional_symptoms_handler(state_dict)
     
-    # Rest of your handlers
+    # Update handlers dictionary to include all dynamic handlers
     handlers = {
         "start": start_node,
+        "initial_assessment": assess_initial_urgency,
         "collect_symptoms": collect_symptoms_handler,
         "prev_history_node": previous_history_handler,
         "med_history_node": medication_history_handler,
         "additional_symptoms_node": additional_symptoms_handler,
         "diagnosis_prep": diagnosis_prep_handler,
         "diagnosis_node": generate_diagnosis,
-        "criticality_node": assess_criticality
+        "criticality_node": assess_criticality,
+        "dynamic_symptoms": dynamic_follow_up_handler,
+        "injury_assessment": dynamic_follow_up_handler,
+        "infection_assessment": dynamic_follow_up_handler,
+        "digestive_assessment": dynamic_follow_up_handler,
+        "respiratory_assessment": dynamic_follow_up_handler,
+        "chronic_condition": dynamic_follow_up_handler,
+        "urgent_follow_up": urgent_follow_up_handler,
+        "emergency_services": urgent_follow_up_handler
     }
     
     handler = handlers.get(step_name)
@@ -900,15 +1566,46 @@ async def validate_response(question, response, expected_type):
             }
         }
     
+    # Handle known medical conditions in initial prompt
+    if expected_type == "symptoms" and any(condition in response.lower() for condition in ["diabetes", "diabetic", "hypertension", "asthma", "chronic"]):
+        # Extract the condition mentioned
+        conditions = []
+        for condition in ["diabetes", "diabetic", "hypertension", "asthma", "copd", "arthritis", "thyroid"]:
+            if condition in response.lower():
+                conditions.append(condition)
+        
+        condition_str = ", ".join(conditions)
+        
+        return {
+            "is_valid": True,
+            "feedback": None,
+            "processed_response": response,
+            "details": {
+                "is_valid": True,
+                "reason": f"Patient disclosed medical condition: {condition_str}",
+                "is_chronic_condition": True,
+                "medical_conditions": conditions,
+                "extracted_symptoms": conditions  # Store as symptoms for processing
+            }
+        }
+    
     # Less strict validation for short answers
-    if len(response.strip()) <= 10:
-        # Only challenge very short answers for symptom collection
+    if len(response.strip()) <= 20:  # Increased length to catch short condition statements
+        # Only challenge very short answers for symptom collection if they don't provide health info
         if expected_type == "symptoms" and response.lower() in ["hi", "hello"]:
             return {
                 "is_valid": False,
                 "feedback": "I need to understand your symptoms to help you. Could you please describe what health issues you're experiencing in more detail?",
                 "processed_response": response,
                 "details": {"is_valid": False, "reason": "Greeting instead of symptoms"}
+            }
+        # For symptoms, we want more detail if the answer is too short but doesn't mention a condition
+        elif expected_type == "symptoms" and not any(word in response.lower() for word in ["diabetes", "pain", "ache", "hurt", "sick"]):
+            return {
+                "is_valid": False,
+                "feedback": "I notice your response is quite brief. Could you please provide more details about your current health concerns or symptoms? This will help me assist you better.",
+                "processed_response": response,
+                "details": {"is_valid": False, "reason": "The user's response is too brief and lacks detail about their current health concern."}
             }
         # For previous_history, allow short answers like "no" or "viral fever"
         elif expected_type == "previous_history":
@@ -1124,6 +1821,93 @@ def validate_multi_part_response(question, response, expected_type):
             }
     
     return {"is_complete": True}
+
+# 3. Add a new "force_diagnosis" endpoint for users to explicitly request a diagnosis
+@app.post("/force_diagnosis")
+async def force_diagnosis(user_data_request: dict):
+    try:
+        user_id = user_data_request.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="User ID is required")
+            
+        user_data = get_user_data(user_id)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Check for emergency situations
+        has_asthma = False
+        lost_inhaler = False
+        breathing_issues = False
+        
+        for item in user_data.history:
+            for key, value in item.items():
+                if isinstance(value, str):
+                    if "asthma" in value.lower():
+                        has_asthma = True
+                    if "lost" in value.lower() and "inhaler" in value.lower():
+                        lost_inhaler = True
+                    if any(phrase in value.lower() for phrase in ["can't breathe", "cant breathe", "difficulty breathing"]):
+                        breathing_issues = True
+        
+        # If this is an asthma emergency, provide immediate response
+        if has_asthma and (lost_inhaler or breathing_issues):
+            # Create an urgent HTML message for asthma attack
+            urgent_html = f"""<div class="urgent-message">
+<div class="urgent-header">⚠️ URGENT ASTHMA EMERGENCY ⚠️</div>
+<div class="urgent-content">
+  <p><strong>1.</strong> Call emergency services (911) immediately</p>
+  <p><strong>2.</strong> Sit upright in a comfortable position</p>
+  <p><strong>3.</strong> Try to remain calm and take slow breaths</p>
+  <p><strong>4.</strong> Remove tight clothing and stay in fresh air</p>
+</div>
+<div class="urgent-footer">Without an inhaler, an asthma attack can be life-threatening. Seek emergency help immediately.</div>
+</div>"""
+            
+            update_user_data(user_id, "current_question", urgent_html)
+            update_user_data(user_id, "current_step", "emergency_services")
+            
+            return {
+                "next_question": urgent_html,
+                "current_step": "emergency_services"
+            }
+        
+        # Standard diagnosis process continues as before...
+        # ... rest of the original function ...
+        
+        # Create state dict for diagnosis preparation
+        state_dict = {
+            "user_id": user_id,
+            "response": "proceed to diagnosis",
+            "is_existing": True,
+            "symptoms": user_data.symptoms,
+            "previous_history": user_data.previous_history,
+            "medication_history": user_data.medication_history,
+            "additional_symptoms": user_data.additional_symptoms,
+            "diagnosis": user_data.diagnosis,
+            "critical": user_data.critical,
+            "current_step": "diagnosis_prep"
+        }
+        
+        # Process the diagnosis preparation step
+        next_state = diagnosis_prep_handler(state_dict)
+        
+        # Extract question (which will be the diagnosis)
+        diagnosis = next_state.get("current_question", "Unable to generate diagnosis with current information")
+        
+        # Update the user state
+        update_user_data(user_id, "current_question", diagnosis)
+        update_user_data(user_id, "current_step", "criticality")
+        
+        return {
+            "next_question": diagnosis,
+            "current_step": "criticality"
+        }
+        
+    except Exception as e:
+        print(f"Error in force_diagnosis endpoint: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
