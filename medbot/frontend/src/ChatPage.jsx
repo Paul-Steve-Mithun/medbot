@@ -3,6 +3,91 @@ import { FiSend, FiRefreshCw, FiFileText, FiPlus, FiMessageCircle, FiClock, FiCh
 import { MdMedicalServices, MdOutlineHistory, MdOutlineHealthAndSafety } from 'react-icons/md';
 import { BsArrowRightCircle, BsExclamationTriangle } from 'react-icons/bs';
 
+const diagnosisStyles = `
+  /* Add new styles for the diagnosis card */
+  .diagnosis-card {
+    background-color: #f0f9ff;
+    border: 1px solid #bae6fd;
+    border-radius: 0.5rem;
+    padding: 1rem;
+    margin-bottom: 0.5rem;
+  }
+  
+  .diagnosis-header {
+    color: #0369a1;
+    font-size: 1rem;
+    font-weight: 700;
+    margin-top: 0.75rem;
+    margin-bottom: 0.5rem;
+    border-bottom: 1px solid #bae6fd;
+    padding-bottom: 0.25rem;
+  }
+  
+  .diagnosis-content {
+    color: #1e3a8a;
+    font-weight: 500;
+    margin-bottom: 0.75rem;
+  }
+  
+  .diagnosis-list {
+    list-style-type: disc;
+    padding-left: 1.5rem;
+    margin-bottom: 0.75rem;
+  }
+  
+  .diagnosis-list li {
+    color: #0284c7;
+    margin-bottom: 0.375rem;
+    font-weight: 500;
+  }
+  
+  .diagnosis-note {
+    font-size: 0.9rem;
+    color: #475569;
+    font-style: italic;
+  }
+  
+  /* Updated urgent message styling */
+  .urgent-message {
+    background-color: #fef2f2;
+    border: 1px solid #f87171;
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    margin-bottom: 0.5rem;
+  }
+  
+  .urgent-header {
+    color: #dc2626;
+    font-size: 1.1rem;
+    font-weight: bold;
+    margin-bottom: 0.75rem;
+    text-align: center;
+  }
+  
+  .urgent-content {
+    color: #b91c1c;
+    margin-bottom: 0.75rem;
+  }
+  
+  .urgent-content p {
+    margin-bottom: 0.5rem;
+    display: block;
+  }
+  
+  .urgent-content p strong {
+    display: inline-block;
+    min-width: 1.5rem;
+  }
+  
+  .urgent-footer {
+    font-size: 0.9rem;
+    font-weight: bold;
+    color: #dc2626;
+    margin-top: 0.5rem;
+    text-align: center;
+  }
+`;
+
 const ChatPage = () => {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -100,6 +185,15 @@ const ChatPage = () => {
       }
     }
   }, [messages]);
+
+  useEffect(() => {
+    const style = document.createElement('style');
+    style.innerHTML = diagnosisStyles;
+    document.head.appendChild(style);
+    return () => {
+      document.head.removeChild(style);
+    };
+  }, []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -426,6 +520,58 @@ const ChatPage = () => {
     handleContinuation();
   };
 
+  // Add this function to the ChatPage component
+  const requestDiagnosis = async () => {
+    try {
+      // Add loading message
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: 'Generating medical diagnosis based on our conversation...',
+        isLoading: true
+      }]);
+
+      // Request diagnosis
+      const response = await fetch('http://localhost:8000/force_diagnosis', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_id: userId
+        }),
+      });
+
+      // Remove loading message
+      setMessages(prev => prev.filter(msg => !msg.isLoading));
+
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      
+      // Add the diagnosis to the chat
+      const diagnosisMessage = { role: 'assistant', content: data.next_question };
+      setMessages(prev => [...prev, diagnosisMessage]);
+      
+      // Update current step
+      setCurrentStep(data.current_step);
+      
+      // If we're now at criticality, fetch user data
+      if (data.current_step === "criticality") {
+        setConversationComplete(true);
+        fetchUserData();
+      }
+      
+    } catch (error) {
+      console.error('Error getting diagnosis:', error);
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `Sorry, I encountered an error generating your diagnosis: ${error.message}`
+      }]);
+    }
+  };
+
   // Render the message bubbles with updated styling
   const renderMessage = (message, index) => {
     const isInvalid = message.role === 'assistant' && 
@@ -440,6 +586,26 @@ const ChatPage = () => {
                              (message.content.includes("I'll now analyze your symptoms") ||
                               message.content.includes("provide a preliminary diagnosis"));
                       
+    // Add a "Get Diagnosis" button after a few exchanges
+    const showDiagnosisButton = messages.length > 4 && 
+                               message.role === 'assistant' && 
+                               !conversationComplete &&
+                               !message.content.includes("diagnosis");
+                      
+    // Check if the message contains HTML
+    const containsHTML = message.role === 'assistant' && 
+                         (message.content.includes('<div class="') || 
+                          message.content.includes('<div class=') ||
+                          message.content.includes('</div>'));
+                      
+    // Detect if this is a likely condition message (diagnosis)
+    const isDiagnosis = message.role === 'assistant' && 
+                       (message.content.includes('LIKELY CONDITION') || 
+                        message.content.includes('## LIKELY CONDITION'));
+                      
+    // Apply special styling for diagnosis even if not HTML
+    const diagnosisStyle = isDiagnosis && !containsHTML ? 'bg-blue-50 border-blue-200' : '';
+                      
     return (
       <div
         key={index}
@@ -452,13 +618,36 @@ const ChatPage = () => {
             message.role === 'user'
               ? 'bg-blue-500 text-white'
               : isInvalid
-                ? 'bg-amber-100 text-amber-800 border border-amber-300' // Warning style
+                ? 'bg-amber-100 text-amber-800 border border-amber-300' 
                 : isPartialAnswer
-                  ? 'bg-orange-100 text-orange-800 border border-orange-300' // Partial answer style
-                  : 'bg-white text-gray-800 border border-gray-200' // Regular assistant message
-          }`}
+                  ? 'bg-orange-100 text-orange-800 border border-orange-300'
+                  : diagnosisStyle || 'bg-white text-gray-800 border border-gray-200'
+          } ${message.role === 'assistant' ? 'diagnosis-formatting' : ''}`}
         >
-          {message.content}
+          {/* Render HTML content if it contains HTML */}
+          {containsHTML ? (
+            <div dangerouslySetInnerHTML={{ __html: message.content }} />
+          ) : isDiagnosis ? (
+            // Special formatting for diagnosis text that isn't HTML
+            <div className="diagnosis-manual">
+              {message.content.split('##').map((section, i) => {
+                if (i === 0) return null; // Skip anything before the first ##
+                
+                const [heading, ...contentArr] = section.split('\n');
+                const content = contentArr.join('\n').trim();
+                
+                return (
+                  <div key={i} className="mb-3">
+                    <div className="text-blue-700 font-bold mb-1">{heading.trim()}</div>
+                    <div className="ml-2">{content}</div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            message.content
+          )}
+          
           {(isInvalid || isPartialAnswer) && (
             <button
               onClick={handleInvalidResponse}
@@ -474,6 +663,15 @@ const ChatPage = () => {
               className="mt-2 p-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-md shadow-sm flex items-center gap-1 transition-colors"
             >
               <BsArrowRightCircle size={14} />
+              <span>Get Diagnosis</span>
+            </button>
+          )}
+          {showDiagnosisButton && (
+            <button
+              onClick={requestDiagnosis}
+              className="mt-2 p-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-md shadow-sm flex items-center gap-1 transition-colors"
+            >
+              <FiFileText size={14} />
               <span>Get Diagnosis</span>
             </button>
           )}
