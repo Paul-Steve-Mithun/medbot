@@ -870,7 +870,7 @@ const ChatPage = () => {
       <div className="w-64 bg-white p-4 border-r border-gray-200 shadow-sm">
         <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
           <MdMedicalServices className="text-blue-500" />
-          <span>Medical Assistant</span>
+          <span>Medbot</span>
         </h2>
         
         {/* Current step indicator */}
@@ -1026,7 +1026,7 @@ const ChatPage = () => {
           <div className="max-w-3xl mx-auto flex justify-between items-center">
             <h1 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
               <MdOutlineHealthAndSafety className="text-blue-500" />
-              <span>Medical Consultation</span>
+              <span>Preliminary Diagnosis</span>
             </h1>
             <div className="text-sm text-gray-500 flex items-center gap-1">
               <FiClock className="text-gray-400" />
