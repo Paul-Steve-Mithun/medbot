@@ -104,6 +104,7 @@ const ChatPage = () => {
   });
   const [conversationComplete, setConversationComplete] = useState(false);
   const [showSummaryButton, setShowSummaryButton] = useState(false);
+  const [messageCount, setMessageCount] = useState(0);
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -156,11 +157,35 @@ const ChatPage = () => {
   }, []);
 
   useEffect(() => {
-    // If we're at the end of the regular conversation flow, show the summary button
-    if (currentStep === "end") {
+    // Check if we've reached recommendations based on message content OR step name
+    const hasRecommendations = hasReachedRecommendations();
+    
+    if (
+      currentStep === "end" || 
+      currentStep === "criticality" || 
+      currentStep === "criticality_node" ||
+      hasRecommendations
+    ) {
+      setShowSummaryButton(true);
+      
+      // Explicitly set conversation complete to true
+      setConversationComplete(true);
+      
+      // Fetch user data to update the sidebar
+      fetchUserData();
+    }
+  }, [currentStep, messages]);
+
+  useEffect(() => {
+    // Check if the latest message contains recommendation indicators
+    const hasRecommendations = hasReachedRecommendations();
+    
+    if (hasRecommendations && !conversationComplete) {
+      console.log("Recommendations detected, marking consultation as complete");
+      setConversationComplete(true);
       setShowSummaryButton(true);
     }
-  }, [currentStep]);
+  }, [messages, conversationComplete]);
 
   useEffect(() => {
     // Check if the latest message contains any of the auto-continue phrases
@@ -194,6 +219,15 @@ const ChatPage = () => {
       document.head.removeChild(style);
     };
   }, []);
+
+  useEffect(() => {
+    // Check if we've reached 5 exchanges (user + assistant = 1 exchange)
+    // Initial welcome message doesn't count, so we check for > 10 total messages
+    if (messageCount >= 5 && !conversationComplete && currentStep !== 'start') {
+      console.log("Reached message exchange limit, triggering forced diagnosis");
+      requestDiagnosis();
+    }
+  }, [messageCount, conversationComplete]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -248,18 +282,20 @@ const ChatPage = () => {
         throw new Error('Invalid response format from server');
       }
 
-      // FIXED PART: Remove the conditional that was adding the system message and duplicating user message
-      // Simply add the bot's response directly
+      // Add the bot's response directly
       const botMessage = { role: 'assistant', content: data.next_question };
       setMessages(prev => [...prev, botMessage]);
+      
+      // Increment message exchange counter
+      setMessageCount(prev => prev + 1);
       
       // Update current step
       if (data.current_step) {
         setCurrentStep(data.current_step);
         
-        // Check if conversation is complete
-        if (data.current_step === "end") {
+        if (data.current_step === "criticality" || data.current_step === "criticality_node") {
           setConversationComplete(true);
+          setShowSummaryButton(true);
           // Fetch user data to update the sidebar
           fetchUserData();
         }
@@ -321,6 +357,7 @@ const ChatPage = () => {
   };
   
   const startNewConsultation = () => {
+    // Reset all state related to the conversation
     setMessages([{
       role: 'assistant',
       content: 'Hello! I am your medical assistant. How can I help you today?'
@@ -335,6 +372,11 @@ const ChatPage = () => {
     });
     setCurrentStep('start');
     setConversationComplete(false);
+    setShowSummaryButton(false);
+    setMessageCount(0); // Reset message counter
+    
+    // Use a new userId to completely separate from previous consultation
+    window.location.reload(); // This is the simplest way to reset everything
   };
 
   // Current step indicator with icons
@@ -346,14 +388,22 @@ const ChatPage = () => {
       "medication_history": { name: "Medication History", icon: <MdMedicalServices /> },
       "additional_symptoms": { name: "Additional Symptoms", icon: <MdOutlineHealthAndSafety /> },
       "diagnosis": { name: "Diagnosis", icon: <FiCheckCircle /> },
+      "diagnosis_prep": { name: "Diagnosis", icon: <FiCheckCircle /> },
+      "diagnosis_node": { name: "Diagnosis", icon: <FiCheckCircle /> },
       "criticality": { name: "Recommendations", icon: <FiAlertCircle /> },
+      "criticality_node": { name: "Recommendations", icon: <FiAlertCircle /> },
       "end": { name: "Consultation Complete", icon: <FiCheckCircle /> }
     };
+    
+    // If conversation is complete, show "Consultation Complete" regardless of the current step
+    if (conversationComplete) {
+      return { name: "Consultation Complete", icon: <FiCheckCircle /> };
+    }
     
     return stepInfo[currentStep] || { name: "Consultation", icon: <FiMessageCircle /> };
   };
 
-  // Add a function to generate the case summary
+  // Update the generateCaseSummary function to apply better formatting
   const generateCaseSummary = async () => {
     try {
       // Add loading message
@@ -383,8 +433,11 @@ const ChatPage = () => {
 
       const data = await response.json();
       
-      // Add the summary to the chat
-      const summaryMessage = { role: 'assistant', content: data.summary };
+      // Format the summary with HTML for better presentation
+      const formattedSummary = formatDoctorSummary(data.summary);
+      
+      // Add the formatted summary to the chat
+      const summaryMessage = { role: 'assistant', content: formattedSummary };
       setMessages(prev => [...prev, summaryMessage]);
       
       // Update conversation state
@@ -398,6 +451,136 @@ const ChatPage = () => {
         content: `Sorry, I encountered an error generating the summary: ${error.message}`
       }]);
     }
+  };
+
+  // Fix the formatDoctorSummary function to eliminate duplicate headers
+  const formatDoctorSummary = (summaryText) => {
+    // Check if the summary is already in HTML format
+    if (summaryText.includes("<div") || summaryText.includes("<h")) {
+      return summaryText; // Already formatted
+    }
+    
+    // Define sections we want to identify and format
+    const sections = [
+      "Medical Case Summary",
+      "Chief Complaint", 
+      "History", 
+      "Medications", 
+      "Assessment", 
+      "Diagnosis",
+      "Likely Condition",
+      "Recommendations"
+    ];
+
+    let formattedHTML = `<div class="diagnosis-card">`;
+    // Add ONLY ONE title at the top
+    formattedHTML += `<h3 class="diagnosis-header text-center">MEDICAL CASE SUMMARY</h3>`;
+    
+    // Remove duplicate "Medical Case Summary" titles from the original text
+    const cleanedText = summaryText.replace(/##?\s*Medical Case Summary\s*##?/gi, "")
+                                   .replace(/\*\*\s*Medical Case Summary\s*\*\*/gi, "");
+    
+    // Process the text by splitting into sections
+    let currentSection = "";
+    // Use the cleaned text without duplicate headers
+    const lines = cleanedText.split('\n').filter(line => line.trim() !== '');
+    
+    // Track if we've seen a section to avoid empty sections
+    let hasAddedSection = false;
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      
+      // Skip empty lines and lines that just contain "Medical Case Summary"
+      if (line === "" || line.match(/^medical case summary$/i)) {
+        continue;
+      }
+      
+      // Check if this line is a section header
+      const isSectionHeader = sections.some(section => 
+        line.toLowerCase().includes(section.toLowerCase()) && 
+        (line.startsWith('**') || line.startsWith('##') || line.startsWith('#'))
+      );
+      
+      if (isSectionHeader) {
+        // Close previous section if there was one
+        if (currentSection && hasAddedSection) {
+          formattedHTML += `</div>`;
+        }
+        
+        // Extract the section name
+        let sectionName = line.replace(/\*\*/g, '').replace(/##?/g, '').trim();
+        if (sectionName.includes(":")) {
+          sectionName = sectionName.split(":")[0].trim();
+        }
+        
+        // Skip "Medical Case Summary" sections since we already added the title
+        if (sectionName.toLowerCase() === "medical case summary") {
+          continue;
+        }
+        
+        // Start a new section
+        currentSection = sectionName;
+        formattedHTML += `<div class="diagnosis-content">`;
+        formattedHTML += `<h4 class="diagnosis-header">${sectionName.toUpperCase()}</h4>`;
+        hasAddedSection = true;
+        
+        // Special handling for Assessment/Diagnosis section to make it bold
+        if (sectionName.includes("Assessment") || sectionName.includes("Diagnosis") || sectionName.includes("Likely Condition")) {
+          // Look ahead to get the diagnosis text
+          let diagnosisText = "";
+          for (let j = i + 1; j < lines.length && !sections.some(s => lines[j].includes(s) && (lines[j].startsWith('**') || lines[j].startsWith('##') || lines[j].startsWith('#'))); j++) {
+            diagnosisText += lines[j].trim() + " ";
+          }
+          
+          // Add the bold diagnosis
+          formattedHTML += `<p><strong>${diagnosisText.trim()}</strong></p>`;
+          
+          // Skip the lines we just processed
+          while (i + 1 < lines.length && !sections.some(s => lines[i + 1].includes(s) && (lines[i + 1].startsWith('**') || lines[i + 1].startsWith('##') || lines[i + 1].startsWith('#')))) {
+            i++;
+          }
+          
+          continue; // Move to the next section
+        }
+      } else if (line.startsWith('-') || line.startsWith('*')) {
+        // This is a bullet point
+        if (!formattedHTML.includes("<ul class=\"diagnosis-list\">")) {
+          formattedHTML += `<ul class="diagnosis-list">`;
+        }
+        formattedHTML += `<li>${line.substring(1).trim()}</li>`;
+        
+        // Check if next line is not a bullet point, close the list
+        if (i + 1 >= lines.length || (!lines[i + 1].startsWith('-') && !lines[i + 1].startsWith('*'))) {
+          formattedHTML += `</ul>`;
+        }
+      } else if (currentSection) {
+        // Regular text within a section
+        // Check for bullet-like text without actual bullets
+        if (line.match(/^\d+\.\s/) || line.includes(": ")) {
+          // Convert numbered points or key-value pairs to bullet points
+          if (!formattedHTML.includes("<ul class=\"diagnosis-list\">")) {
+            formattedHTML += `<ul class="diagnosis-list">`;
+          }
+          formattedHTML += `<li>${line.trim()}</li>`;
+          
+          // Check if next line is not a similar format, close the list
+          if (i + 1 >= lines.length || (!lines[i + 1].match(/^\d+\.\s/) && !lines[i + 1].includes(": "))) {
+            formattedHTML += `</ul>`;
+          }
+        } else {
+          formattedHTML += `<p>${line}</p>`;
+        }
+      }
+    }
+    
+    // Close any open section and the main container
+    if (currentSection && hasAddedSection) {
+      formattedHTML += `</div>`;
+    }
+    formattedHTML += `</div>`;
+    
+    return formattedHTML;
   };
 
   // Add a new function to handle automatic continuation
@@ -558,8 +741,9 @@ const ChatPage = () => {
       setCurrentStep(data.current_step);
       
       // If we're now at criticality, fetch user data
-      if (data.current_step === "criticality") {
+      if (data.current_step === "criticality" || data.current_step === "criticality_node") {
         setConversationComplete(true);
+        setShowSummaryButton(true);
         fetchUserData();
       }
       
@@ -570,6 +754,19 @@ const ChatPage = () => {
         content: `Sorry, I encountered an error generating your diagnosis: ${error.message}`
       }]);
     }
+  };
+
+  // Add this helper function to determine if the consultation has reached the recommendation stage
+  const hasReachedRecommendations = () => {
+    // Check if any message contains urgency level text or recommendation headers
+    return messages.some(m => 
+      m.content && (
+        m.content.includes("URGENCY LEVEL") || 
+        m.content.includes("PRECAUTIONS") ||
+        m.content.includes("TIMEFRAME") ||
+        (m.content.includes("LIKELY CONDITION") && m.content.includes("ACTION STEPS"))
+      )
+    );
   };
 
   // Render the message bubbles with updated styling
@@ -585,12 +782,6 @@ const ChatPage = () => {
     const needsContinuation = message.role === 'assistant' && 
                              (message.content.includes("I'll now analyze your symptoms") ||
                               message.content.includes("provide a preliminary diagnosis"));
-                      
-    // Add a "Get Diagnosis" button after a few exchanges
-    const showDiagnosisButton = messages.length > 4 && 
-                               message.role === 'assistant' && 
-                               !conversationComplete &&
-                               !message.content.includes("diagnosis");
                       
     // Check if the message contains HTML
     const containsHTML = message.role === 'assistant' && 
@@ -666,15 +857,6 @@ const ChatPage = () => {
               <span>Get Diagnosis</span>
             </button>
           )}
-          {showDiagnosisButton && (
-            <button
-              onClick={requestDiagnosis}
-              className="mt-2 p-1.5 bg-green-600 hover:bg-green-700 text-white text-sm rounded-md shadow-sm flex items-center gap-1 transition-colors"
-            >
-              <FiFileText size={14} />
-              <span>Get Diagnosis</span>
-            </button>
-          )}
         </div>
       </div>
     );
@@ -696,8 +878,8 @@ const ChatPage = () => {
           <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-100">
             <p className="text-gray-500 text-sm mb-1">Current step:</p>
             <div className="flex items-center gap-2 text-blue-700 font-medium">
-              {stepInfo.icon}
-              <span>{stepInfo.name}</span>
+              {conversationComplete ? <FiCheckCircle /> : stepInfo.icon}
+              <span>{conversationComplete ? "Diagnosis Complete" : stepInfo.name}</span>
             </div>
           </div>
         )}
@@ -713,57 +895,114 @@ const ChatPage = () => {
               "additional_symptoms": "Additional Info",
               "diagnosis": "Diagnosis",
               "criticality": "Recommendations"
-            }).map(([key, label]) => (
-              <div key={key} className="flex items-center gap-2">
-                <div className={`w-3 h-3 rounded-full ${
-                  ["end", key].includes(currentStep) || 
-                  (currentStep === "criticality" && key !== "criticality" && key !== "end") || 
-                  (currentStep === "diagnosis" && ["symptoms", "previous_history", "medication_history", "additional_symptoms"].includes(key))
-                    ? 'bg-green-500' 
-                    : currentStep === key 
-                      ? 'bg-blue-500' 
-                      : 'bg-gray-300'
-                }`}></div>
-                <span className={`text-sm ${
-                  currentStep === key 
-                    ? 'text-blue-700 font-medium' 
-                    : 'text-gray-600'
-                }`}>{label}</span>
-              </div>
-            ))}
+            }).map(([key, label]) => {
+              // Determine if this step should be marked as completed (green)
+              let isCompleted = false;
+              
+              // Map current step to completed progress indicators
+              const stepsCompleted = {
+                // Initial steps
+                "start": [],
+                
+                // Symptom collection steps (all mark Symptoms as complete)
+                "initial_assessment": ["symptoms"],
+                "dynamic_symptoms": ["symptoms"],
+                "injury_assessment": ["symptoms"],
+                "infection_assessment": ["symptoms"],
+                "digestive_assessment": ["symptoms"],
+                "respiratory_assessment": ["symptoms"],
+                "chronic_condition": ["symptoms"],
+                "urgent_follow_up": ["symptoms"],
+                "emergency_services": ["symptoms"],
+                
+                // Medical history steps (mark Symptoms and Medical History as complete)
+                "previous_history": ["symptoms", "previous_history"],
+                "prev_history_node": ["symptoms", "previous_history"],
+                
+                // Medication steps (mark Symptoms, Medical History, and Medications as complete)
+                "medication_history": ["symptoms", "previous_history", "medication_history"],
+                "med_history_node": ["symptoms", "previous_history", "medication_history"],
+                
+                // Additional symptoms (mark all previous steps as complete)
+                "additional_symptoms": ["symptoms", "previous_history", "medication_history", "additional_symptoms"],
+                "additional_symptoms_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms"],
+                
+                // Diagnosis preparation (everything except recommendations)
+                "diagnosis_prep": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
+                
+                // Diagnosis (everything except recommendations)
+                "diagnosis": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
+                "diagnosis_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
+                
+                // Final steps (everything complete)
+                "criticality": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"],
+                "criticality_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"],
+                "end": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"]
+              };
+              
+              // Check if the current step has this key as completed
+              const completedItems = stepsCompleted[currentStep] || [];
+              isCompleted = completedItems.includes(key);
+              
+              // Also check if patient data has this information to handle cases where step might not be accurate
+              if (key === "symptoms" && patientData.symptoms && patientData.symptoms.length > 0) {
+                isCompleted = true;
+              } else if (key === "previous_history" && patientData.previous_history) {
+                isCompleted = true;
+              } else if (key === "medication_history" && patientData.medication_history) {
+                isCompleted = true;
+              } else if (key === "additional_symptoms" && patientData.additional_symptoms) {
+                isCompleted = true;
+              } else if (key === "diagnosis" && patientData.diagnosis) {
+                isCompleted = true;
+              } else if (key === "criticality" && conversationComplete) {
+                isCompleted = true;
+              }
+              
+              return (
+                <div key={key} className="flex items-center gap-2">
+                  <div className={`w-3 h-3 rounded-full ${
+                    isCompleted
+                      ? 'bg-green-500' 
+                      : currentStep === key 
+                        ? 'bg-blue-500' 
+                        : 'bg-gray-300'
+                  }`}></div>
+                  <span className={`text-sm ${
+                    currentStep === key 
+                      ? 'text-blue-700 font-medium' 
+                      : isCompleted
+                        ? 'text-green-700'
+                        : 'text-gray-600'
+                  }`}>{label}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
         
-        {/* Chat history */}
-        <div className="mt-4 border-t border-gray-200 pt-4">
-          <h3 className="text-gray-700 font-medium flex items-center gap-1.5 mb-2">
-            <FiClock className="text-gray-500" />
-            <span>Conversation History</span>
-          </h3>
-          <div className="space-y-1.5 max-h-[200px] overflow-y-auto pr-1">
-            {chatHistory.length > 0 ? chatHistory.map((chat, index) => (
-              <div
-                key={index}
-                className="p-2 hover:bg-gray-100 rounded-md cursor-pointer text-gray-600 text-sm flex items-center gap-1.5"
-              >
-                <FiMessageCircle className="text-gray-400 flex-shrink-0" />
-                <span className="truncate">{chat.title}</span>
-              </div>
-            )) : (
-              <p className="text-gray-400 text-sm italic p-2">No previous conversations</p>
-            )}
+        {/* Get Diagnosis button - NEW! Only show when conversation has started but not completed */}
+        {!conversationComplete && currentStep !== 'start' && (
+          <div className="mt-4 text-center">
+            <button
+              onClick={requestDiagnosis}
+              className="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2"
+            >
+              <FiFileText />
+              <span>Get Diagnosis</span>
+            </button>
           </div>
-        </div>
+        )}
         
         {/* Generate Summary button */}
-        {showSummaryButton && (
+        {(showSummaryButton || currentStep === "criticality" || currentStep === "criticality_node" || currentStep === "end") && (
           <div className="mt-4 text-center">
             <button
               onClick={generateCaseSummary}
               className="w-full bg-green-600 hover:bg-green-700 text-white px-4 py-2.5 rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2"
             >
               <FiFileText />
-              <span>Generate Case Summary</span>
+              <span>Doctor Summary</span>
             </button>
           </div>
         )}

@@ -56,6 +56,11 @@ def get_user_data(user_id: str):
 def update_user_data(user_id: str, key: str, value: str, validation_details=None):
     user = get_user_data(user_id)
     
+    # Make sure the value is a string, not a dictionary
+    if isinstance(value, dict):
+        # Convert dict to string if accidentally passed
+        value = str(value)
+    
     # Add the new entry with validation details if provided
     entry = {key: value}
     if validation_details:
