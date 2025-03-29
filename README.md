@@ -2,6 +2,8 @@
 
 MedBot is an intelligent medical assistant web application that provides instant medical guidance and personalized health consultations through an advanced AI-powered chatbot.
 
+## LIVE URL : https://medbot-dc8e.onrender.com/
+
 ## 🔍 Features
 
 - **AI-Powered Symptom Analysis**: Advanced diagnostic assistance using cutting-edge artificial intelligence
