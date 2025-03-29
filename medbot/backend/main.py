@@ -9,12 +9,11 @@ import os
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from datetime import timedelta
 
 # Load environment variables
 load_dotenv()
@@ -2128,6 +2127,164 @@ async def force_diagnosis(user_data_request: dict):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+# Add this new ChatHistoryEntry model class
+class ChatHistoryEntry(BaseModel):
+    user_id: str
+    history_entry: dict
+
+# Add the save_chat_history endpoint
+@app.post("/save_chat_history")
+async def save_chat_history(entry_data: ChatHistoryEntry, token: str = Depends(oauth2_scheme)):
+    # Validate the user through token
+    current_user = await get_current_user(token)
+    if current_user["user_id"] != entry_data.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to save history for this user"
+        )
+    
+    try:
+        # Get the user's document from MongoDB
+        user_doc = users_collection.find_one({"user_id": entry_data.user_id})
+        
+        if not user_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+            
+        # Initialize chat_history if it doesn't exist
+        if "chat_history" not in user_doc:
+            user_doc["chat_history"] = []
+        
+        # Check if this is a summary entry
+        is_summary = entry_data.history_entry.get("type") == "summary"
+        
+        if is_summary:
+            # For summaries, check if we already have a summary from the same consultation
+            # (within 5 minutes of this entry)
+            entry_time = datetime.fromisoformat(entry_data.history_entry.get("timestamp")) if "timestamp" in entry_data.history_entry else datetime.fromtimestamp(entry_data.history_entry.get("id") / 1000)
+            
+            # Look for existing summaries in the last 5 minutes
+            existing_summaries = []
+            for i, history_item in enumerate(user_doc["chat_history"]):
+                if history_item.get("type") == "summary":
+                    item_time = datetime.fromisoformat(history_item.get("timestamp")) if "timestamp" in history_item else datetime.fromtimestamp(history_item.get("id") / 1000)
+                    time_diff = abs((entry_time - item_time).total_seconds())
+                    
+                    # If within 5 minutes, consider it from the same consultation
+                    if time_diff < 300:  # 5 minutes in seconds
+                        existing_summaries.append((i, history_item))
+            
+            if existing_summaries:
+                # If we have existing summaries from this consultation
+                # If this is a Doctor Summary, replace any existing summary
+                if entry_data.history_entry.get("title") == "Doctor Summary":
+                    for idx, _ in existing_summaries:
+                        user_doc["chat_history"].pop(idx)
+                    user_doc["chat_history"].append(entry_data.history_entry)
+                # Otherwise, only add if we don't already have a Doctor Summary
+                else:
+                    has_doctor_summary = any(s[1].get("title") == "Doctor Summary" for s in existing_summaries)
+                    if not has_doctor_summary:
+                        user_doc["chat_history"].append(entry_data.history_entry)
+            else:
+                # No existing summaries found, add this one
+                user_doc["chat_history"].append(entry_data.history_entry)
+        else:
+            # Add the new history entry (not a summary)
+            user_doc["chat_history"].append(entry_data.history_entry)
+        
+        # Update the user document
+        users_collection.update_one(
+            {"user_id": entry_data.user_id},
+            {"$set": {"chat_history": user_doc["chat_history"]}}
+        )
+        
+        return {"status": "success", "message": "Chat history saved successfully"}
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error saving chat history: {str(e)}"
+        )
+
+# Add a new endpoint to view historical summaries without saving again
+@app.get("/view_summary/{user_id}/{summary_id}")
+async def view_summary(user_id: str, summary_id: str, token: str = Depends(oauth2_scheme)):
+    # Validate the user through token
+    current_user = await get_current_user(token)
+    if current_user["user_id"] != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this summary"
+        )
+    
+    try:
+        # Get the user's document from MongoDB
+        user_doc = users_collection.find_one({"user_id": user_id})
+        
+        if not user_doc or "chat_history" not in user_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User or chat history not found"
+            )
+        
+        # Find the summary in the chat history
+        summary = None
+        for entry in user_doc["chat_history"]:
+            # Check by id (could be string or int)
+            entry_id = str(entry.get("id"))
+            if entry_id == summary_id:
+                summary = entry
+                break
+        
+        if not summary:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Summary not found"
+            )
+        
+        return {"summary": summary}
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving summary: {str(e)}"
+        )
+
+# Add endpoint to get chat history
+@app.get("/chat_history/{user_id}")
+async def get_chat_history(user_id: str, token: str = Depends(oauth2_scheme)):
+    # Validate the user through token
+    current_user = await get_current_user(token)
+    if current_user["user_id"] != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access history for this user"
+        )
+    
+    try:
+        # Get the user's document from MongoDB
+        user_doc = users_collection.find_one({"user_id": user_id})
+        
+        if not user_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+            
+        # Return chat history or empty list if none exists
+        chat_history = user_doc.get("chat_history", [])
+        
+        return {"chat_history": chat_history}
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error retrieving chat history: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn

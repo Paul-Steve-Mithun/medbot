@@ -9,12 +9,64 @@ const LoginPage = () => {
   const { login } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [errors, setErrors] = useState({});
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+
+  // Handle input change with validation
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    
+    if (name === 'email') {
+      setEmail(value);
+    } else if (name === 'password') {
+      setPassword(value);
+    }
+    
+    // Clear error when user types
+    if (errors[name]) {
+      setErrors({
+        ...errors,
+        [name]: ''
+      });
+    }
+  };
+
+  const validateForm = () => {
+    const newErrors = {};
+    
+    // Email validation
+    if (!email.trim()) {
+      newErrors.email = 'Email is required';
+    } else if (!/\S+@\S+\.\S+/.test(email)) {
+      newErrors.email = 'Email is invalid';
+    }
+    
+    // Password validation
+    if (!password.trim()) {
+      newErrors.password = 'Password is required';
+    } else if (password.length < 8) {
+      newErrors.password = 'Password must be at least 8 characters';
+    } else if (!/[A-Z]/.test(password)) {
+      newErrors.password = 'Password must contain at least one capital letter';
+    } else if (!/[0-9]/.test(password)) {
+      newErrors.password = 'Password must contain at least one number';
+    } else if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]+/.test(password)) {
+      newErrors.password = 'Password must contain at least one special character';
+    }
+    
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
+    
+    if (!validateForm()) {
+      return;
+    }
+    
     setIsLoading(true);
 
     try {
@@ -102,13 +154,15 @@ const LoginPage = () => {
                   name="email"
                   type="email"
                   autoComplete="email"
-                  required
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                  onChange={handleChange}
+                  className={`block w-full pl-10 pr-3 py-2 border ${errors.email ? 'border-red-500 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'} rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none sm:text-sm`}
                   placeholder="you@example.com"
                 />
               </div>
+              {errors.email && (
+                <p className="mt-1 text-sm text-red-600">{errors.email}</p>
+              )}
             </div>
 
             <div>
@@ -124,13 +178,19 @@ const LoginPage = () => {
                   name="password"
                   type="password"
                   autoComplete="current-password"
-                  required
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                  onChange={handleChange}
+                  className={`block w-full pl-10 pr-3 py-2 border ${errors.password ? 'border-red-500 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'} rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none sm:text-sm`}
                   placeholder="••••••••"
                 />
               </div>
+              {errors.password ? (
+                <p className="mt-1 text-sm text-red-600">{errors.password}</p>
+              ) : (
+                <p className="mt-1 text-xs text-gray-500">
+                  Password must be at least 8 characters and contain at least one capital letter, one number, and one special character.
+                </p>
+              )}
             </div>
 
             <div>
@@ -157,4 +217,4 @@ const LoginPage = () => {
   );
 };
 
-export default LoginPage; 
+export default LoginPage;

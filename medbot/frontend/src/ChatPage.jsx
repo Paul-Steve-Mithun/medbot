@@ -123,8 +123,30 @@ const ChatPage = () => {
     // If we have a user from auth context, use their ID
     if (user && user.user_id) {
       setUserId(user.user_id);
+      // Fetch chat history for this user
+      fetchChatHistory(user.user_id);
     } else {
-      // No authenticated user, redirect to login
+      // Try to restore user from localStorage before redirecting
+      const storedUser = localStorage.getItem('medbot_user');
+      const storedToken = localStorage.getItem('medbot_token');
+      
+      if (storedUser && storedToken) {
+        // Parse the stored user data
+        try {
+          const parsedUser = JSON.parse(storedUser);
+          if (parsedUser && parsedUser.user_id) {
+            // Set the user ID for this component
+            setUserId(parsedUser.user_id);
+            // Fetch chat history for this user
+            fetchChatHistory(parsedUser.user_id);
+            return; // Don't redirect, we've restored the user
+          }
+        } catch (e) {
+          console.error("Error parsing stored user data:", e);
+        }
+      }
+      
+      // No authenticated user or failed to restore from localStorage, redirect to login
       navigate('/login');
     }
   }, [user, navigate]);
@@ -135,6 +157,9 @@ const ChatPage = () => {
       role: 'assistant',
       content: 'Hello! I am your medical assistant. How can I help you today?'
     }]);
+    
+    // Ensure message count is reset to 0 when component mounts
+    setMessageCount(0);
     
     // Don't immediately send a backend request here - wait for user input
   }, []);
@@ -269,6 +294,9 @@ const ChatPage = () => {
         isLoading: true
       }]);
 
+      // For the first message in a completely new conversation, make sure we reset the step
+      const isFirstMessage = currentStep === 'start' && messageCount === 0;
+      
       // Use fetchWithAuth instead of fetch
       const response = await fetchWithAuth('http://localhost:8000/chat', {
         method: 'POST',
@@ -277,7 +305,10 @@ const ChatPage = () => {
         },
         body: JSON.stringify({
           user_id: userId,
-          response: currentInput
+          response: currentInput,
+          new_conversation: isFirstMessage, // Tell backend this is a fresh conversation
+          reset_context: isFirstMessage, // Additional flag to force context reset
+          ignore_previous: true // Ignore any previous conversation context for safer handling
         }),
       });
 
@@ -285,7 +316,7 @@ const ChatPage = () => {
       setMessages(prev => prev.filter(msg => !msg.isLoading));
 
       if (!response.ok) {
-        const errorData = await response.json();
+        const errorData = await response.json().catch(() => ({}));
         console.error('Server error:', errorData);
         
         // If unauthorized, redirect to login
@@ -294,6 +325,22 @@ const ChatPage = () => {
           localStorage.removeItem('medbot_user');
           navigate('/login');
           throw new Error('Session expired. Please login again.');
+        }
+
+        // Check if it's the known AIMessage error
+        if (errorData.detail && errorData.detail.includes("AIMessage' object has no attribute 'strip")) {
+          // Fall back to getting a diagnosis directly
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: "I'm having trouble processing your input. Let me try to provide a diagnosis based on what I know so far."
+          }]);
+          
+          // Try to force a diagnosis after a short delay
+          setTimeout(() => {
+            requestDiagnosis();
+          }, 1500);
+          
+          return;
         }
         
         throw new Error(errorData.detail || `Server error: ${response.status}`);
@@ -333,15 +380,23 @@ const ChatPage = () => {
       // Remove loading message if it exists
       setMessages(prev => prev.filter(msg => !msg.isLoading));
       
-      // Add error message
+      // Add error message with fallback option
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Sorry, I encountered an error: ${error.message}. Please try again.`
+        content: `Sorry, I encountered an error: ${error.message}. Let's try to get a diagnosis based on what we know so far.`
       }]);
+      
+      // Show the diagnosis button to help the user continue
+      if (currentStep !== 'start') {
+        setShowSummaryButton(true);
+      }
     }
   };
   
   const updateChatHistory = (userMessage, botResponse) => {
+    // Instead of updating the UI state for every message, 
+    // we'll only save this to the backend but not show it in the sidebar
+    
     // Create a new history entry with title based on first few words of user message
     const title = userMessage.length > 20 
       ? userMessage.substring(0, 20) + '...' 
@@ -356,7 +411,9 @@ const ChatPage = () => {
       ]
     };
     
-    setChatHistory(prev => [newEntry, ...prev]);
+    // Don't update the chat history UI for regular conversations
+    // Only backend storage
+    saveChatHistoryToBackend(newEntry);
   };
   
   const fetchUserData = async () => {
@@ -381,7 +438,7 @@ const ChatPage = () => {
   };
   
   const startNewConsultation = () => {
-    // Reset all state related to the conversation
+    // Reset all state related to the conversation with a completely fresh state
     setMessages([{
       role: 'assistant',
       content: 'Hello! I am your medical assistant. How can I help you today?'
@@ -396,37 +453,40 @@ const ChatPage = () => {
       critical: false
     });
     
+    // Make sure we're truly starting from the beginning
     setCurrentStep('start');
     setConversationComplete(false);
     setShowSummaryButton(false);
     setMessageCount(0); // Reset message counter
     
-    // Create a new consultation ID in the existing user's data store
-    // Skip the window.location.reload() which is causing the logout issue
-    console.log("Starting new consultation with existing user ID:", userId);
+    // Create a fresh user ID to completely isolate this conversation
+    // This is a more aggressive approach but ensures a clean slate
+    const newSessionId = `user-${user.user_id}-session-${Date.now()}`;
+    setUserId(newSessionId);
     
-    // Optional: You can send a simple message to reset the backend state
-    // without creating a new endpoint
+    // Reset backend state
     const resetBackendState = async () => {
       try {
-        // Use the existing chat endpoint with a special "reset" message
-        const response = await fetchWithAuth('http://localhost:8000/chat', {
+        // Request complete reset from backend
+        const response = await fetchWithAuth('http://localhost:8000/force_diagnosis', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            user_id: userId,
-            response: "__reset__" // Special token that your backend can recognize
+            user_id: newSessionId, // Use the new session ID
+            reset: true,
+            complete_reset: true
           }),
         });
         
         if (!response.ok) {
           console.error('Failed to reset backend state');
+        } else {
+          console.log('Successfully reset backend state for new consultation');
         }
       } catch (error) {
         console.error('Error resetting backend state:', error);
-        // Even if this fails, we'll still continue with the reset front-end state
       }
     };
     
@@ -457,7 +517,7 @@ const ChatPage = () => {
     return stepInfo[currentStep] || { name: "Consultation", icon: <FiMessageCircle /> };
   };
 
-  // Update the generateCaseSummary function to apply better formatting
+  // Update the generateCaseSummary function to save the summary to chat history
   const generateCaseSummary = async () => {
     try {
       // Add loading message
@@ -498,12 +558,56 @@ const ChatPage = () => {
       setConversationComplete(true);
       setShowSummaryButton(false);
       
+      // Save the summary to chat history with a special title
+      saveSummaryToHistory("Doctor Summary", formattedSummary);
+      
     } catch (error) {
       console.error('Error generating summary:', error);
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: `Sorry, I encountered an error generating the summary: ${error.message}`
       }]);
+    }
+  };
+
+  // New function to save summaries and recommendations to chat history
+  const saveSummaryToHistory = (title, content) => {
+    const newEntry = {
+      id: Date.now(),
+      title: title,
+      type: "summary", // Mark as a special entry type
+      messages: [
+        { role: 'assistant', content: content }
+      ],
+      timestamp: new Date().toISOString()
+    };
+    
+    // Update the UI chat history with this summary
+    setChatHistory(prev => [newEntry, ...prev]);
+    
+    // Also save to MongoDB via the backend
+    saveChatHistoryToBackend(newEntry);
+  };
+  
+  // Function to save chat history to backend
+  const saveChatHistoryToBackend = async (historyEntry) => {
+    try {
+      const response = await fetchWithAuth('http://localhost:8000/save_chat_history', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_id: userId,
+          history_entry: historyEntry
+        }),
+      });
+      
+      if (!response.ok) {
+        console.error('Failed to save chat history to backend');
+      }
+    } catch (error) {
+      console.error('Error saving chat history:', error);
     }
   };
 
@@ -649,15 +753,19 @@ const ChatPage = () => {
         isLoading: true
       }]);
 
-      // Send a continuation request
-      const response = await fetch('http://localhost:8000/chat', {
+      // Check if this is an early stage in the conversation
+      const isEarlyStage = messageCount < 3 || currentStep === 'start';
+
+      // Send a continuation request - using fetchWithAuth instead of fetch
+      const response = await fetchWithAuth('http://localhost:8000/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           user_id: userId,
-          response: "continue" // Send a special token to indicate automatic continuation
+          response: "continue", // Send a special token to indicate automatic continuation
+          preserve_context: !isEarlyStage // Only preserve context if we're not in early stages
         }),
       });
 
@@ -665,7 +773,18 @@ const ChatPage = () => {
       setMessages(prev => prev.filter(msg => !msg.isLoading));
 
       if (!response.ok) {
-        throw new Error(`Server error: ${response.status}`);
+        const errorStatus = response.status;
+        const errorData = await response.json().catch(() => ({}));
+        console.error('Server error details:', errorData);
+        
+        // Handle different error statuses appropriately
+        if (errorStatus === 401) {
+          logout();
+          navigate('/login');
+          throw new Error('Session expired. Please login again.');
+        } else {
+          throw new Error(`Server error: ${errorStatus}`);
+        }
       }
 
       const data = await response.json();
@@ -688,17 +807,28 @@ const ChatPage = () => {
         }
       }
       
+      // Increment message count - important for tracking conversation progress
+      setMessageCount(prev => prev + 1);
+      
     } catch (error) {
       console.error('Error in automatic continuation:', error);
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Sorry, I encountered an error: ${error.message}. Please try again.`
+        content: `Sorry, I couldn't continue automatically. As an alternative, please try the "Get Diagnosis" button to generate a diagnosis based on our conversation so far.`
       }]);
+      
+      // Show the diagnosis option regardless of where we are in the conversation
+      setShowSummaryButton(true);
     }
   };
 
   // Add logic to determine when a message is invalid feedback
   const isInvalidFeedback = (message) => {
+    // Don't treat responses as invalid if we're just starting a new conversation (message count < 3)
+    if (messageCount < 3) {
+      return false;
+    }
+    
     return message.role === 'assistant' && 
            message.content.includes("doesn't seem to address my question");
   };
@@ -709,46 +839,39 @@ const ChatPage = () => {
       // Add loading message
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: '...',
+        content: 'Processing your response...',
         isLoading: true
       }]);
 
-      // Send a force continue request
-      const response = await fetch('http://localhost:8000/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          user_id: userId,
-          response: "continue_anyway" // Special token to bypass validation
-        }),
-      });
-
-      // Remove loading message
-      setMessages(prev => prev.filter(msg => !msg.isLoading));
-
-      if (!response.ok) {
-        throw new Error(`Server error: ${response.status}`);
-      }
-
-      const data = await response.json();
-      
-      // Add the bot's response to the chat
-      const botMessage = { role: 'assistant', content: data.next_question };
-      setMessages(prev => [...prev, botMessage]);
-      
-      // Update current step
-      if (data.current_step) {
-        setCurrentStep(data.current_step);
-      }
+      // Remove loading message after a short delay
+      setTimeout(() => {
+        setMessages(prev => prev.filter(msg => !msg.isLoading));
+        
+        // Add a transition message
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: "I notice we're having some trouble with the conversation flow. Let me try to provide a diagnosis based on the information so far."
+        }]);
+        
+        // Skip the problematic backend call and directly request diagnosis
+        setTimeout(() => {
+          requestDiagnosis();
+        }, 1500);
+      }, 1000);
       
     } catch (error) {
       console.error('Error in handling invalid response:', error);
+      setMessages(prev => prev.filter(msg => !msg.isLoading));
+      
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Sorry, I encountered an error: ${error.message}. Please try again.`
+        content: `Sorry, I encountered an error. Let me try to generate a diagnosis with what I know.`
       }]);
+      
+      // Still try to get a diagnosis
+      setTimeout(() => {
+        requestDiagnosis();
+      }, 1500);
     }
   };
 
@@ -757,7 +880,7 @@ const ChatPage = () => {
     handleContinuation();
   };
 
-  // Add this function to the ChatPage component
+  // Update the requestDiagnosis function to save recommendations
   const requestDiagnosis = async () => {
     try {
       // Add loading message
@@ -767,14 +890,15 @@ const ChatPage = () => {
         isLoading: true
       }]);
 
-      // Request diagnosis
-      const response = await fetch('http://localhost:8000/force_diagnosis', {
+      // Request diagnosis - using fetchWithAuth instead of fetch
+      const response = await fetchWithAuth('http://localhost:8000/force_diagnosis', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          user_id: userId
+          user_id: userId,
+          fallback: true // Add fallback flag to handle LLM errors more gracefully
         }),
       });
 
@@ -782,7 +906,21 @@ const ChatPage = () => {
       setMessages(prev => prev.filter(msg => !msg.isLoading));
 
       if (!response.ok) {
-        throw new Error(`Server error: ${response.status}`);
+        const errorStatus = response.status;
+        const errorData = await response.json().catch(() => ({}));
+        console.error('Server error details:', errorData);
+        
+        // Handle different error statuses appropriately
+        if (errorStatus === 401) {
+          logout();
+          navigate('/login');
+          throw new Error('Session expired. Please login again.');
+        } else if (errorData.detail && errorData.detail.includes("AIMessage")) {
+          // LLM-specific error
+          throw new Error('The AI model encountered an error processing your information. Please try again with a simpler query.');
+        } else {
+          throw new Error(`Server error: ${errorStatus}`);
+        }
       }
 
       const data = await response.json();
@@ -792,21 +930,28 @@ const ChatPage = () => {
       setMessages(prev => [...prev, diagnosisMessage]);
       
       // Update current step
-      setCurrentStep(data.current_step);
+      setCurrentStep(data.current_step || "diagnosis");
       
-      // If we're now at criticality, fetch user data
+      // Mark conversation as complete even if we don't get criticality step
+      setConversationComplete(true);
+      setShowSummaryButton(true);
+      fetchUserData();
+      
+      // If we're now at criticality, fetch user data and save recommendation to history
       if (data.current_step === "criticality" || data.current_step === "criticality_node") {
-        setConversationComplete(true);
-        setShowSummaryButton(true);
-        fetchUserData();
+        // Save the recommendation to chat history
+        saveSummaryToHistory("Medical Recommendation", data.next_question);
       }
       
     } catch (error) {
       console.error('Error getting diagnosis:', error);
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Sorry, I encountered an error generating your diagnosis: ${error.message}`
+        content: `I apologize, but I'm having trouble generating a complete diagnosis due to a technical issue: ${error.message}. You can try starting a new consultation with more specific symptoms or try again later.`
       }]);
+      
+      // Still mark conversation as complete to avoid loops
+      setConversationComplete(true);
     }
   };
 
@@ -825,10 +970,10 @@ const ChatPage = () => {
 
   // Render the message bubbles with updated styling
   const renderMessage = (message, index) => {
-    const isInvalid = message.role === 'assistant' && 
-                      message.content.includes("doesn't seem to address my question");
+    const isInvalid = isInvalidFeedback(message);
                       
     const isPartialAnswer = message.role === 'assistant' && 
+                            messageCount >= 3 && // Only apply this logic after a few messages
                             (message.content.includes("Could you please also tell me about") ||
                              message.content.includes("You mentioned seeing a doctor") ||
                              message.content.includes("also share what diagnosis"));
@@ -944,185 +1089,422 @@ const ChatPage = () => {
     navigate('/login');
   };
 
+  // Update the fetchChatHistory function to filter duplicates
+  const fetchChatHistory = async (userId) => {
+    try {
+      const response = await fetchWithAuth(`http://localhost:8000/chat_history/${userId}`);
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.chat_history && Array.isArray(data.chat_history)) {
+          // First filter to only include summary entries
+          const summaryEntries = data.chat_history.filter(entry => 
+            entry.type === "summary" || 
+            (entry.title && (
+              entry.title === "Doctor Summary" || 
+              entry.title === "Medical Recommendation"
+            ))
+          );
+          
+          // Then filter duplicates
+          const uniqueHistoryEntries = filterDuplicateSummaries(summaryEntries);
+          
+          // Sort history by timestamp/id (newest first)
+          const sortedHistory = [...uniqueHistoryEntries].sort((a, b) => {
+            return new Date(b.timestamp || b.id) - new Date(a.timestamp || a.id);
+          });
+          
+          setChatHistory(sortedHistory);
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching chat history:', error);
+    }
+  };
+  
+  // Add a new function to filter duplicate summaries
+  const filterDuplicateSummaries = (historyEntries) => {
+    // Group by consultation session (assuming entries from the same session are close in time)
+    const sessionMap = new Map();
+    
+    // First, sort by timestamp to ensure oldest entries come first
+    const sortedEntries = [...historyEntries].sort((a, b) => {
+      return new Date(a.timestamp || a.id) - new Date(b.timestamp || b.id);
+    });
+    
+    // Process each entry
+    sortedEntries.forEach(entry => {
+      // For regular chat entries, always keep them
+      if (!entry.type || entry.type !== "summary") {
+        sessionMap.set(entry.id, entry);
+        return;
+      }
+      
+      // For summary entries, check if we have another summary within 5 minutes
+      const entryTime = new Date(entry.timestamp || entry.id).getTime();
+      let isDuplicate = false;
+      
+      // Check against existing summary entries
+      sessionMap.forEach((existingEntry, existingId) => {
+        if (existingEntry.type === "summary") {
+          const existingTime = new Date(existingEntry.timestamp || existingEntry.id).getTime();
+          const timeDiff = Math.abs(entryTime - existingTime) / (1000 * 60); // difference in minutes
+          
+          // If within 5 minutes of another summary, consider it from the same consultation
+          if (timeDiff < 5) {
+            // Keep only the doctor summary (or the most recent if both are the same type)
+            if (entry.title === "Doctor Summary" || 
+               (entry.title === existingEntry.title && entryTime > existingTime)) {
+              // Replace the existing entry with this one
+              sessionMap.delete(existingId);
+              isDuplicate = false; // Reset to false so this one gets added
+            } else {
+              isDuplicate = true;
+            }
+          }
+        }
+      });
+      
+      // Add this entry if it's not a duplicate
+      if (!isDuplicate) {
+        sessionMap.set(entry.id, entry);
+      }
+    });
+    
+    return Array.from(sessionMap.values());
+  };
+
+  // Update the renderChatHistoryItem function to use the view_summary endpoint
+  const renderChatHistoryItem = (entry) => {
+    // Determine if this is a special entry like a summary or recommendation
+    const isSummary = entry.type === "summary";
+    const messagePreview = entry.messages && entry.messages.length > 0
+      ? entry.messages[entry.messages.length - 1].content
+      : "";
+    
+    // For HTML content, strip the HTML tags for the preview
+    const stripHtml = (html) => {
+      const tmp = document.createElement("DIV");
+      tmp.innerHTML = html;
+      return tmp.textContent || tmp.innerText || "";
+    };
+    
+    const previewText = messagePreview.includes('<div') || messagePreview.includes('<h')
+      ? stripHtml(messagePreview).substring(0, 50) + (stripHtml(messagePreview).length > 50 ? '...' : '')
+      : messagePreview.substring(0, 50) + (messagePreview.length > 50 ? '...' : '');
+    
+    return (
+      <div 
+        key={entry.id} 
+        className={`p-2 rounded border transition-colors cursor-pointer ${
+          isSummary 
+            ? 'bg-blue-50 border-blue-200 hover:bg-blue-100' 
+            : 'bg-white border-gray-200 hover:bg-blue-50'
+        }`}
+        onClick={() => {
+          // Logic to display this conversation
+          console.log("Selected conversation:", entry);
+          
+          // If it's a summary/recommendation, display it without saving again
+          if (isSummary) {
+            // Just display from the already fetched data
+            displaySummaryFromHistory(entry);
+          } else {
+            // For regular chat entries, display the conversation
+            if (entry.messages && entry.messages.length > 0) {
+              // Start a fresh chat with just these messages
+              setMessages([
+                { role: 'assistant', content: 'Here is a previous conversation:' },
+                ...entry.messages
+              ]);
+              setCurrentStep('start');
+              setConversationComplete(true);
+            }
+          }
+        }}
+      >
+        <div className="flex items-center justify-between">
+          <span className={`text-sm font-medium truncate max-w-[80%] ${
+            isSummary ? 'text-blue-700' : 'text-gray-700'
+          }`}>
+            {entry.title}
+          </span>
+          <span className="text-xs text-gray-400">
+            {new Date(entry.timestamp || entry.id).toLocaleDateString()}
+          </span>
+        </div>
+        <p className="text-xs text-gray-500 mt-1 truncate">
+          {previewText}
+        </p>
+      </div>
+    );
+  };
+  
+  // Add a helper function to display a summary from history
+  const displaySummaryFromHistory = async (summaryEntry) => {
+    // Show loading indicator
+    setMessages([
+      { role: 'assistant', content: 'Loading summary...' }
+    ]);
+    
+    try {
+      // Use the backend endpoint to get the full summary
+      const response = await fetchWithAuth(`http://localhost:8000/view_summary/${userId}/${summaryEntry.id}`);
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.summary && data.summary.messages && data.summary.messages.length > 0) {
+          const summaryMessage = { role: 'assistant', content: data.summary.messages[0].content };
+          setMessages([
+            { role: 'assistant', content: `${data.summary.title} from ${new Date(data.summary.timestamp || data.summary.id).toLocaleDateString()}:` },
+            summaryMessage
+          ]);
+        } else {
+          // Fallback to using the preview data if the API request doesn't return usable data
+          const summaryMessage = { role: 'assistant', content: summaryEntry.messages[0].content };
+          setMessages([
+            { role: 'assistant', content: `${summaryEntry.title} from ${new Date(summaryEntry.timestamp || summaryEntry.id).toLocaleDateString()}:` },
+            summaryMessage
+          ]);
+        }
+      } else {
+        // API error, use fallback
+        console.error('Error fetching summary:', response.statusText);
+        const summaryMessage = { role: 'assistant', content: summaryEntry.messages[0].content };
+        setMessages([
+          { role: 'assistant', content: `${summaryEntry.title} from ${new Date(summaryEntry.timestamp || summaryEntry.id).toLocaleDateString()}:` },
+          summaryMessage
+        ]);
+      }
+    } catch (error) {
+      console.error('Error fetching summary:', error);
+      // Fallback to the data we already have
+      const summaryMessage = { role: 'assistant', content: summaryEntry.messages[0].content };
+      setMessages([
+        { role: 'assistant', content: `${summaryEntry.title} from ${new Date(summaryEntry.timestamp || summaryEntry.id).toLocaleDateString()}:` },
+        summaryMessage
+      ]);
+    }
+    
+    // Reset state to show we're viewing a historical summary
+    setCurrentStep('start'); 
+    setConversationComplete(true);
+  };
+
   return (
     <div className="flex h-screen bg-gray-50">
-      {/* Sidebar - now with light theme */}
-      <div className="w-64 bg-white p-4 border-r border-gray-200 shadow-sm">
-        {/* User profile section */}
-        {user && (
-          <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-100">
-            <div className="flex items-center mb-2">
-              <div className="bg-blue-500 text-white rounded-full w-8 h-8 flex items-center justify-center">
-                {user.name.charAt(0).toUpperCase()}
-              </div>
-              <div className="ml-2">
-                <p className="font-medium text-gray-800">{user.name}</p>
-                <p className="text-xs text-gray-500">{user.email}</p>
-              </div>
-            </div>
-            <button
-              onClick={handleLogout}
-              className="text-sm text-blue-600 hover:text-blue-800"
-            >
-              Sign out
-            </button>
-          </div>
-        )}
-
-        <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
-          <MdMedicalServices className="text-blue-500" />
-          <span>Medical Assistant</span>
-        </h2>
-        
-        {/* Current step indicator */}
-        {currentStep !== 'start' && (
-          <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-100">
-            <p className="text-gray-500 text-sm mb-1">Current step:</p>
-            <div className="flex items-center gap-2 text-blue-700 font-medium">
-              {conversationComplete ? <FiCheckCircle /> : stepInfo.icon}
-              <span>{conversationComplete ? "Diagnosis Complete" : stepInfo.name}</span>
-            </div>
-          </div>
-        )}
-        
-        {/* Progress steps */}
-        <div className="mb-4 p-3 bg-gray-50 rounded-lg border border-gray-200">
-          <p className="text-gray-600 text-sm mb-2 font-medium">Consultation Progress</p>
-          <div className="space-y-2">
-            {Object.entries({
-              "symptoms": "Symptoms",
-              "previous_history": "Medical History",
-              "medication_history": "Medications",
-              "additional_symptoms": "Additional Info",
-              "diagnosis": "Diagnosis",
-              "criticality": "Recommendations"
-            }).map(([key, label]) => {
-              // Determine if this step should be marked as completed (green)
-              let isCompleted = false;
-              
-              // Map current step to completed progress indicators
-              const stepsCompleted = {
-                // Initial steps
-                "start": [],
-                
-                // Symptom collection steps (all mark Symptoms as complete)
-                "initial_assessment": ["symptoms"],
-                "dynamic_symptoms": ["symptoms"],
-                "injury_assessment": ["symptoms"],
-                "infection_assessment": ["symptoms"],
-                "digestive_assessment": ["symptoms"],
-                "respiratory_assessment": ["symptoms"],
-                "chronic_condition": ["symptoms"],
-                "urgent_follow_up": ["symptoms"],
-                "emergency_services": ["symptoms"],
-                
-                // Medical history steps (mark Symptoms and Medical History as complete)
-                "previous_history": ["symptoms", "previous_history"],
-                "prev_history_node": ["symptoms", "previous_history"],
-                
-                // Medication steps (mark Symptoms, Medical History, and Medications as complete)
-                "medication_history": ["symptoms", "previous_history", "medication_history"],
-                "med_history_node": ["symptoms", "previous_history", "medication_history"],
-                
-                // Additional symptoms (mark all previous steps as complete)
-                "additional_symptoms": ["symptoms", "previous_history", "medication_history", "additional_symptoms"],
-                "additional_symptoms_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms"],
-                
-                // Diagnosis preparation (everything except recommendations)
-                "diagnosis_prep": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
-                
-                // Diagnosis (everything except recommendations)
-                "diagnosis": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
-                "diagnosis_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
-                
-                // Final steps (everything complete)
-                "criticality": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"],
-                "criticality_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"],
-                "end": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"]
-              };
-              
-              // Check if the current step has this key as completed
-              const completedItems = stepsCompleted[currentStep] || [];
-              isCompleted = completedItems.includes(key);
-              
-              // Also check if patient data has this information to handle cases where step might not be accurate
-              if (key === "symptoms" && patientData.symptoms && patientData.symptoms.length > 0) {
-                isCompleted = true;
-              } else if (key === "previous_history" && patientData.previous_history) {
-                isCompleted = true;
-              } else if (key === "medication_history" && patientData.medication_history) {
-                isCompleted = true;
-              } else if (key === "additional_symptoms" && patientData.additional_symptoms) {
-                isCompleted = true;
-              } else if (key === "diagnosis" && patientData.diagnosis) {
-                isCompleted = true;
-              } else if (key === "criticality" && conversationComplete) {
-                isCompleted = true;
-              }
-              
-              return (
-                <div key={key} className="flex items-center gap-2">
-                  <div className={`w-3 h-3 rounded-full ${
-                    isCompleted
-                      ? 'bg-green-500' 
-                      : currentStep === key 
-                        ? 'bg-blue-500' 
-                        : 'bg-gray-300'
-                  }`}></div>
-                  <span className={`text-sm ${
-                    currentStep === key 
-                      ? 'text-blue-700 font-medium' 
-                      : isCompleted
-                        ? 'text-green-700'
-                        : 'text-gray-600'
-                  }`}>{label}</span>
+      {/* Sidebar - with scrollable content */}
+      <div className="w-64 bg-white border-r border-gray-200 shadow-sm flex flex-col h-screen">
+        {/* Scrollable sidebar content */}
+        <div className="p-4 overflow-y-auto flex-grow">
+          {/* User profile section */}
+          {user && (
+            <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-100">
+              <div className="flex items-center mb-2">
+                <div className="bg-blue-500 text-white rounded-full w-8 h-8 flex items-center justify-center">
+                  {user.name.charAt(0).toUpperCase()}
                 </div>
-              );
-            })}
+                <div className="ml-2">
+                  <p className="font-medium text-gray-800">{user.name}</p>
+                  <p className="text-xs text-gray-500">{user.email}</p>
+                </div>
+              </div>
+              <button
+                onClick={handleLogout}
+                className="text-sm text-blue-600 hover:text-blue-800"
+              >
+                Sign out
+              </button>
+            </div>
+          )}
+
+          <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
+            <MdMedicalServices className="text-blue-500" />
+            <span>Medical Assistant</span>
+          </h2>
+          
+          {/* Current step indicator */}
+          {currentStep !== 'start' && (
+            <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-100">
+              <p className="text-gray-500 text-sm mb-1">Current step:</p>
+              <div className="flex items-center gap-2 text-blue-700 font-medium">
+                {conversationComplete ? <FiCheckCircle /> : stepInfo.icon}
+                <span>{conversationComplete ? "Diagnosis Complete" : stepInfo.name}</span>
+              </div>
+            </div>
+          )}
+          
+          {/* Progress steps */}
+          <div className="mb-4 p-3 bg-gray-50 rounded-lg border border-gray-200">
+            <p className="text-gray-600 text-sm mb-2 font-medium">Consultation Progress</p>
+            <div className="space-y-2">
+              {Object.entries({
+                "symptoms": "Symptoms",
+                "previous_history": "Medical History",
+                "medication_history": "Medications",
+                "additional_symptoms": "Additional Info",
+                "diagnosis": "Diagnosis",
+                "criticality": "Recommendations"
+              }).map(([key, label]) => {
+                // Determine if this step should be marked as completed (green)
+                let isCompleted = false;
+                
+                // Map current step to completed progress indicators
+                const stepsCompleted = {
+                  // Initial steps
+                  "start": [],
+                  
+                  // Symptom collection steps (all mark Symptoms as complete)
+                  "initial_assessment": ["symptoms"],
+                  "dynamic_symptoms": ["symptoms"],
+                  "injury_assessment": ["symptoms"],
+                  "infection_assessment": ["symptoms"],
+                  "digestive_assessment": ["symptoms"],
+                  "respiratory_assessment": ["symptoms"],
+                  "chronic_condition": ["symptoms"],
+                  "urgent_follow_up": ["symptoms"],
+                  "emergency_services": ["symptoms"],
+                  
+                  // Medical history steps (mark Symptoms and Medical History as complete)
+                  "previous_history": ["symptoms", "previous_history"],
+                  "prev_history_node": ["symptoms", "previous_history"],
+                  
+                  // Medication steps (mark Symptoms, Medical History, and Medications as complete)
+                  "medication_history": ["symptoms", "previous_history", "medication_history"],
+                  "med_history_node": ["symptoms", "previous_history", "medication_history"],
+                  
+                  // Additional symptoms (mark all previous steps as complete)
+                  "additional_symptoms": ["symptoms", "previous_history", "medication_history", "additional_symptoms"],
+                  "additional_symptoms_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms"],
+                  
+                  // Diagnosis preparation (everything except recommendations)
+                  "diagnosis_prep": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
+                  
+                  // Diagnosis (everything except recommendations)
+                  "diagnosis": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
+                  "diagnosis_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis"],
+                  
+                  // Final steps (everything complete)
+                  "criticality": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"],
+                  "criticality_node": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"],
+                  "end": ["symptoms", "previous_history", "medication_history", "additional_symptoms", "diagnosis", "criticality"]
+                };
+                
+                // Check if the current step has this key as completed
+                const completedItems = stepsCompleted[currentStep] || [];
+                isCompleted = completedItems.includes(key);
+                
+                // Also check if patient data has this information to handle cases where step might not be accurate
+                if (key === "symptoms" && patientData.symptoms && patientData.symptoms.length > 0) {
+                  isCompleted = true;
+                } else if (key === "previous_history" && patientData.previous_history) {
+                  isCompleted = true;
+                } else if (key === "medication_history" && patientData.medication_history) {
+                  isCompleted = true;
+                } else if (key === "additional_symptoms" && patientData.additional_symptoms) {
+                  isCompleted = true;
+                } else if (key === "diagnosis" && patientData.diagnosis) {
+                  isCompleted = true;
+                } else if (key === "criticality" && conversationComplete) {
+                  isCompleted = true;
+                }
+                
+                return (
+                  <div key={key} className="flex items-center gap-2">
+                    <div className={`w-3 h-3 rounded-full ${
+                      isCompleted
+                        ? 'bg-green-500' 
+                        : currentStep === key 
+                          ? 'bg-blue-500' 
+                          : 'bg-gray-300'
+                    }`}></div>
+                    <span className={`text-sm ${
+                      currentStep === key 
+                        ? 'text-blue-700 font-medium' 
+                        : isCompleted
+                          ? 'text-green-700'
+                          : 'text-gray-600'
+                    }`}>{label}</span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
+          
+          {/* Chat History Section */}
+          {chatHistory.length > 0 && chatHistory.some(entry => entry.messages && entry.messages.length > 0) && (
+            <div className="mb-4 p-3 bg-gray-50 rounded-lg border border-gray-200">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-gray-600 text-sm font-medium">Medical Summaries</p>
+                {chatHistory.length > 0 && (
+                  <button 
+                    className="text-xs text-blue-600 hover:text-blue-800"
+                    onClick={() => setChatHistory([])}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+              
+              <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                {chatHistory.slice(0, 10)
+                  .filter(entry => entry.messages && entry.messages.length > 0)
+                  .map((entry) => renderChatHistoryItem(entry))
+                }
+                
+                {chatHistory.length > 10 && (
+                  <div className="text-center text-xs text-gray-500 pt-1">
+                    + {chatHistory.length - 10} more summaries
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          
+          {/* Get Diagnosis button - Only show when conversation has started but not completed */}
+          {!conversationComplete && currentStep !== 'start' && (
+            <div className="mt-4 text-center">
+              <button
+                onClick={requestDiagnosis}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2"
+              >
+                <FiFileText />
+                <span>Get Diagnosis</span>
+              </button>
+            </div>
+          )}
+          
+          {/* Generate Summary button */}
+          {(showSummaryButton || currentStep === "criticality" || currentStep === "criticality_node" || currentStep === "end") && (
+            <div className="mt-4 text-center">
+              <button
+                onClick={generateCaseSummary}
+                className="w-full bg-green-600 hover:bg-green-700 text-white px-4 py-2.5 rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2"
+              >
+                <FiFileText />
+                <span>Doctor Summary</span>
+              </button>
+            </div>
+          )}
+          
+          {/* New consultation button */}
+          {conversationComplete && (
+            <div className="mt-4 text-center pb-4">
+              <button
+                onClick={startNewConsultation}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white rounded-lg py-2.5 transition-colors shadow-sm flex items-center justify-center gap-2"
+              >
+                <FiPlus />
+                <span>Start New Consultation</span>
+              </button>
+            </div>
+          )}
         </div>
-        
-        {/* Get Diagnosis button - NEW! Only show when conversation has started but not completed */}
-        {!conversationComplete && currentStep !== 'start' && (
-          <div className="mt-4 text-center">
-            <button
-              onClick={requestDiagnosis}
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2"
-            >
-              <FiFileText />
-              <span>Get Diagnosis</span>
-            </button>
-          </div>
-        )}
-        
-        {/* Generate Summary button */}
-        {(showSummaryButton || currentStep === "criticality" || currentStep === "criticality_node" || currentStep === "end") && (
-          <div className="mt-4 text-center">
-            <button
-              onClick={generateCaseSummary}
-              className="w-full bg-green-600 hover:bg-green-700 text-white px-4 py-2.5 rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2"
-            >
-              <FiFileText />
-              <span>Doctor Summary</span>
-            </button>
-          </div>
-        )}
-        
-        {/* New consultation button */}
-        {conversationComplete && (
-          <button
-            onClick={startNewConsultation}
-            className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white rounded-lg py-2.5 transition-colors shadow-sm flex items-center justify-center gap-2"
-          >
-            <FiPlus />
-            <span>Start New Consultation</span>
-          </button>
-        )}
       </div>
 
-      {/* Main Chat Area */}
-      <div className="flex-1 flex flex-col">
-        {/* Chat header */}
+      {/* Main Chat Area - fixed layout */}
+      <div className="flex-1 flex flex-col h-screen overflow-hidden">
+        {/* Chat header - fixed at top */}
         <div className="p-4 border-b border-gray-200 bg-white shadow-sm">
           <div className="max-w-3xl mx-auto flex justify-between items-center">
             <h1 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
@@ -1136,7 +1518,7 @@ const ChatPage = () => {
           </div>
         </div>
         
-        {/* Chat Messages */}
+        {/* Chat Messages - scrollable */}
         <div className="flex-1 overflow-y-auto p-6 bg-gray-50">
           <div className="max-w-3xl mx-auto">
             {messages.map((message, index) => renderMessage(message, index))}
@@ -1144,7 +1526,7 @@ const ChatPage = () => {
           </div>
         </div>
 
-        {/* Input Area */}
+        {/* Input Area - fixed at bottom */}
         <div className="border-t border-gray-200 p-4 bg-white">
           <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
             <div className="flex gap-3">

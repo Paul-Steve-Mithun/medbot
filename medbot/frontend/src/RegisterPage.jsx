@@ -22,6 +22,7 @@ const RegisterPage = () => {
     medications: [],
     allergies: []
   });
+  const [errors, setErrors] = useState({});
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [tempComorbidity, setTempComorbidity] = useState('');
@@ -87,44 +88,91 @@ const RegisterPage = () => {
 
   const handleChange = (e) => {
     const { name, value } = e.target;
-    setFormData({
-      ...formData,
-      [name]: value
-    });
+    
+    // For name field, only allow alphabets and spaces
+    if (name === 'name') {
+      // Replace any non-alphabet and non-space character with empty string
+      const sanitizedValue = value.replace(/[^A-Za-z\s]/g, '');
+      setFormData({
+        ...formData,
+        [name]: sanitizedValue
+      });
+    } else {
+      setFormData({
+        ...formData,
+        [name]: value
+      });
+    }
+    
+    // Clear error when user types
+    if (errors[name]) {
+      setErrors({
+        ...errors,
+        [name]: ''
+      });
+    }
   };
 
   const validateFirstStep = () => {
+    const newErrors = {};
+    
+    // Name validation
     if (!formData.name.trim()) {
-      setError('Name is required');
-      return false;
+      newErrors.name = 'Name is required';
+    } else if (formData.name.trim().length < 2) {
+      newErrors.name = 'Name must be at least 2 characters';
+    } else if (!/^[A-Za-z\s]+$/.test(formData.name)) {
+      newErrors.name = 'Name should only contain alphabets and spaces';
     }
+
+    // Email validation
     if (!formData.email.trim()) {
-      setError('Email is required');
-      return false;
+      newErrors.email = 'Email is required';
+    } else if (!/\S+@\S+\.\S+/.test(formData.email)) {
+      newErrors.email = 'Email is invalid';
     }
-    if (!formData.password.trim()) {
-      setError('Password is required');
-      return false;
+    
+    // Password validation
+    if (!formData.password) {
+      newErrors.password = 'Password is required';
+    } else if (formData.password.length < 8) {
+      newErrors.password = 'Password must be at least 8 characters';
+    } else if (!/[A-Z]/.test(formData.password)) {
+      newErrors.password = 'Password must contain at least one capital letter';
+    } else if (!/[0-9]/.test(formData.password)) {
+      newErrors.password = 'Password must contain at least one number';
+    } else if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]+/.test(formData.password)) {
+      newErrors.password = 'Password must contain at least one special character';
     }
-    if (formData.password !== formData.confirmPassword) {
-      setError('Passwords do not match');
-      return false;
+    
+    // Confirm password validation
+    if (!formData.confirmPassword) {
+      newErrors.confirmPassword = 'Please confirm your password';
+    } else if (formData.password !== formData.confirmPassword) {
+      newErrors.confirmPassword = 'Passwords do not match';
     }
-    setError('');
-    return true;
+    
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
   };
 
   const validateSecondStep = () => {
+    const newErrors = {};
+    
+    // Gender validation
     if (!formData.gender) {
-      setError('Gender is required');
-      return false;
+      newErrors.gender = 'Gender is required';
     }
-    if (!formData.age || isNaN(formData.age) || formData.age <= 0) {
-      setError('Valid age is required');
-      return false;
+    
+    // Age validation
+    if (!formData.age) {
+      newErrors.age = 'Age is required';
+    } else if (isNaN(formData.age) || parseInt(formData.age) <= 0 || parseInt(formData.age) > 120) {
+      newErrors.age = 'Please enter a valid age (1-120)';
     }
-    setError('');
-    return true;
+    
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
   };
 
   const handleNext = () => {
@@ -137,6 +185,8 @@ const RegisterPage = () => {
 
   const handleBack = () => {
     setCurrentStep(currentStep - 1);
+    // Clear errors when going back
+    setErrors({});
   };
 
   const handleSubmit = async (e) => {
@@ -267,13 +317,15 @@ const RegisterPage = () => {
                       id="name"
                       name="name"
                       type="text"
-                      required
                       value={formData.name}
                       onChange={handleChange}
-                      className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                      className={`block w-full pl-10 pr-3 py-2 border ${errors.name ? 'border-red-500 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'} rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none sm:text-sm`}
                       placeholder="Enter your name"
                     />
                   </div>
+                  {errors.name && (
+                    <p className="mt-1 text-sm text-red-600">{errors.name}</p>
+                  )}
                 </div>
 
                 <div>
@@ -289,13 +341,15 @@ const RegisterPage = () => {
                       name="email"
                       type="email"
                       autoComplete="email"
-                      required
                       value={formData.email}
                       onChange={handleChange}
-                      className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                      className={`block w-full pl-10 pr-3 py-2 border ${errors.email ? 'border-red-500 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'} rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none sm:text-sm`}
                       placeholder="you@example.com"
                     />
                   </div>
+                  {errors.email && (
+                    <p className="mt-1 text-sm text-red-600">{errors.email}</p>
+                  )}
                 </div>
 
                 <div>
@@ -311,13 +365,19 @@ const RegisterPage = () => {
                       name="password"
                       type="password"
                       autoComplete="new-password"
-                      required
                       value={formData.password}
                       onChange={handleChange}
-                      className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                      className={`block w-full pl-10 pr-3 py-2 border ${errors.password ? 'border-red-500 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'} rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none sm:text-sm`}
                       placeholder="••••••••"
                     />
                   </div>
+                  {errors.password ? (
+                    <p className="mt-1 text-sm text-red-600">{errors.password}</p>
+                  ) : (
+                    <p className="mt-1 text-xs text-gray-500">
+                      Password must be at least 8 characters and contain at least one capital letter, one number, and one special character.
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -333,13 +393,15 @@ const RegisterPage = () => {
                       name="confirmPassword"
                       type="password"
                       autoComplete="new-password"
-                      required
                       value={formData.confirmPassword}
                       onChange={handleChange}
-                      className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                      className={`block w-full pl-10 pr-3 py-2 border ${errors.confirmPassword ? 'border-red-500 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'} rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none sm:text-sm`}
                       placeholder="••••••••"
                     />
                   </div>
+                  {errors.confirmPassword && (
+                    <p className="mt-1 text-sm text-red-600">{errors.confirmPassword}</p>
+                  )}
                 </div>
 
                 <div className="flex justify-end">
@@ -358,25 +420,38 @@ const RegisterPage = () => {
             {currentStep === 2 && (
               <div className="space-y-6">
                 <div>
-                  <label htmlFor="gender" className="block text-sm font-medium text-gray-700">
+                  <label htmlFor="gender" className="block text-sm font-medium text-gray-700 mb-1">
                     Gender
                   </label>
                   <div className="mt-2 grid grid-cols-2 gap-3">
                     <div
-                      className={`flex items-center p-3 border ${formData.gender === 'male' ? 'border-blue-500 bg-blue-50' : 'border-gray-300'} rounded-md cursor-pointer hover:bg-gray-50`}
-                      onClick={() => setFormData({ ...formData, gender: 'male' })}
+                      className={`flex items-center p-3 border ${errors.gender ? 'border-red-500' : formData.gender === 'male' ? 'border-blue-500 bg-blue-50' : 'border-gray-300'} rounded-md cursor-pointer hover:bg-gray-50`}
+                      onClick={() => {
+                        setFormData({ ...formData, gender: 'male' });
+                        if (errors.gender) {
+                          setErrors({ ...errors, gender: '' });
+                        }
+                      }}
                     >
                       <BiMaleFemale className={`${formData.gender === 'male' ? 'text-blue-500' : 'text-gray-400'} mr-2`} />
                       <span className={`${formData.gender === 'male' ? 'text-blue-700 font-medium' : 'text-gray-700'}`}>Male</span>
                     </div>
                     <div
-                      className={`flex items-center p-3 border ${formData.gender === 'female' ? 'border-blue-500 bg-blue-50' : 'border-gray-300'} rounded-md cursor-pointer hover:bg-gray-50`}
-                      onClick={() => setFormData({ ...formData, gender: 'female' })}
+                      className={`flex items-center p-3 border ${errors.gender ? 'border-red-500' : formData.gender === 'female' ? 'border-blue-500 bg-blue-50' : 'border-gray-300'} rounded-md cursor-pointer hover:bg-gray-50`}
+                      onClick={() => {
+                        setFormData({ ...formData, gender: 'female' });
+                        if (errors.gender) {
+                          setErrors({ ...errors, gender: '' });
+                        }
+                      }}
                     >
                       <BiMaleFemale className={`${formData.gender === 'female' ? 'text-blue-500' : 'text-gray-400'} mr-2`} />
                       <span className={`${formData.gender === 'female' ? 'text-blue-700 font-medium' : 'text-gray-700'}`}>Female</span>
                     </div>
                   </div>
+                  {errors.gender && (
+                    <p className="mt-1 text-sm text-red-600">{errors.gender}</p>
+                  )}
                 </div>
 
                 <div>
@@ -391,15 +466,17 @@ const RegisterPage = () => {
                       id="age"
                       name="age"
                       type="number"
-                      required
                       min="1"
                       max="120"
                       value={formData.age}
                       onChange={handleChange}
-                      className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                      className={`block w-full pl-10 pr-3 py-2 border ${errors.age ? 'border-red-500 focus:ring-red-500 focus:border-red-500' : 'border-gray-300 focus:ring-blue-500 focus:border-blue-500'} rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none sm:text-sm`}
                       placeholder="30"
                     />
                   </div>
+                  {errors.age && (
+                    <p className="mt-1 text-sm text-red-600">{errors.age}</p>
+                  )}
                 </div>
 
                 <div className="flex justify-between">
